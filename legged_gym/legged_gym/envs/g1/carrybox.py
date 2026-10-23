@@ -335,6 +335,7 @@ class LeggedRobot(BaseTask):
         self._reset_env_tensors(env_ids)
 
         # reset buffers
+        self.has_reached_box[env_ids] = False
         self.last_actions[env_ids] = 0.
         self.last_last_actions[env_ids] = 0.
         self.last_dof_vel[env_ids] = 0.
@@ -442,10 +443,13 @@ class LeggedRobot(BaseTask):
         box_quat_local = quat_mul(quat_conjugate(self.rigid_body_states[:, self.upper_body_index, 3:7]), self.box_states[:, 3:7])
         box_rot_6d_local = quat_to_tan_norm(box_quat_local)
 
-        goal_pos = self.goal_pos - self.root_states[:, 0:3]
-        goal_pos_local = quat_rotate_inverse(self.rigid_body_states[:, self.upper_body_index, 3:7], goal_pos)
+        # Use current states: cached robot2object_dist can predate an episode reset.
+        distance_xy = torch.norm(box_pos[:, :2], dim=-1)
+        self.has_reached_box |= distance_xy < self.cfg.rewards.thresh_robot2object
+        velocity_command = torch.zeros(self.num_envs, 3, device=self.device)
+        velocity_command[~self.has_reached_box, 0] = self.cfg.rewards.target_speed_loco
 
-        task_obs_critic = torch.cat((box_pos_local, box_rot_6d_local, self._box_size, goal_pos_local), dim=-1)
+        task_obs_critic = torch.cat((box_pos_local, box_rot_6d_local, self._box_size, velocity_command), dim=-1)
         
         if self.add_noise:
             is_coarse = (self.robot2object_dist >= self.thresh_tag) | ((self.robot2object_dist < self.thresh_tag) & (~self.can_see_tag) & (~self.has_seen_tag))
@@ -466,15 +470,10 @@ class LeggedRobot(BaseTask):
             box_quat_local[is_mask] = self.default_quat
             box_rot_6d_local = quat_to_tan_norm(box_quat_local)
 
-            goal_pos += torch_rand_float(-self.box_cfg.pos_noise_scale, self.box_cfg.pos_noise_scale, (self.num_envs, 3), device=self.device)
-            goal_pos_local = quat_rotate_inverse(self.rigid_body_states[:, self.upper_body_index, 3:7], goal_pos)
-
-            task_obs_actor = torch.cat((box_pos_local, box_rot_6d_local, self._box_size, goal_pos_local), dim=-1)
+            task_obs_actor = torch.cat((box_pos_local, box_rot_6d_local, self._box_size, velocity_command), dim=-1)
         else:
             task_obs_actor = task_obs_critic.clone()
 
-        task_obs_actor[self.success_buf] = -1.0  # success flag
-    
         return task_obs_actor, task_obs_critic
 
     def compute_observations(self):
@@ -1093,6 +1092,7 @@ class LeggedRobot(BaseTask):
         self.extras = {}
         self.skill = self.box_cfg.skill
         self.skill_init_prob = torch.tensor(self.box_cfg.skill_init_prob, device=self.device)
+        self.has_reached_box = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self.tag_normal_local = torch.tensor([0, 0, 1.0], dtype=torch.float, device=self.device)
         self.tag_pos = torch.zeros(self.num_envs, 4, 3, dtype=torch.float, device=self.device, requires_grad=False)
         self.default_zero_task = torch.zeros(self.num_envs, self.num_task_obs, dtype=torch.float, device=self.device, requires_grad=False)
