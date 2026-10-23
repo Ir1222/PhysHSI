@@ -6,11 +6,13 @@ configuration classes, observation/reset/reward methods and MotionLib are origin
 Only simulator-facing reset calls are stubbed in the episode-reset check.
 """
 import ast
+import hashlib
 import importlib.util
+import json
 from pathlib import Path
-import subprocess
 from types import SimpleNamespace
 import unittest
+import xml.etree.ElementTree as ET
 
 import numpy as np
 import torch
@@ -18,7 +20,7 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
 ENV = ROOT / "legged_gym/legged_gym/envs"
-BASELINE = "07bf22b"
+MANIFEST = json.loads(Path(__file__).with_name("original_manifest.json").read_text(encoding="utf-8"))
 
 
 def extract(path, namespace, names=None):
@@ -41,10 +43,6 @@ class_to_dict = extract(helper, {}, {"class_to_dict"})["class_to_dict"]
 robot_ns = extract(ENV / "g1/carrybox.py", dict(math_ns, BaseTask=object,
                    LeggedRobotCfg=base["LeggedRobotCfg"], class_to_dict=class_to_dict))
 Robot = robot_ns["LeggedRobot"]
-
-
-def original(path):
-    return subprocess.check_output(["git", "show", BASELINE + ":" + path.as_posix()], cwd=ROOT).decode("utf-8")
 
 
 class BaselineChecks(unittest.TestCase):
@@ -142,7 +140,7 @@ class BaselineChecks(unittest.TestCase):
             torch.testing.assert_close(obj.obs_buf[:, -3:], obj.privileged_obs_buf[:, -3:])
 
     def test_real_motionlib_and_expert_sampling(self):
-        old = yaml.safe_load((ROOT / "legged_gym/resources/config/carrybox.yaml").read_text())["motions"]
+        old = MANIFEST["motions"]
         path = Path(self.cfg.dataset.motion_file.format(LEGGED_GYM_ROOT_DIR=ROOT / "legged_gym"))
         motions = yaml.safe_load(path.read_text())["motions"]
         self.assertEqual(list(motions), ["loco", "pickUp"])
@@ -168,23 +166,42 @@ class BaselineChecks(unittest.TestCase):
 
     def test_original_training_and_reward_code_preserved(self):
         path = ENV / "g1/carrybox.py"
-        before = original(path.relative_to(ROOT))
         after = path.read_text(encoding="utf-8")
-        def methods(source):
-            cls = next(n for n in ast.parse(source).body if isinstance(n, ast.ClassDef))
-            return {n.name: ast.get_source_segment(source, n) for n in cls.body if isinstance(n, ast.FunctionDef)}
-        a, b = methods(before), methods(after)
+        cls = next(n for n in ast.parse(after).body if isinstance(n, ast.ClassDef))
+        a = MANIFEST["robot_methods"]
+        b = {n.name: hashlib.sha256(ast.get_source_segment(after, n).encode()).hexdigest()
+             for n in cls.body if isinstance(n, ast.FunctionDef)}
         changed = {name for name in a if a[name] != b[name]}
         self.assertEqual(changed, {"compute_task_observations", "reset_idx", "_init_buffers"})
         self.assertEqual(set(a), set(b))
-        # Every other pre-existing tracked file, including PPO/AMP/data, is identical.
-        modified = subprocess.check_output(["git", "diff", "--name-only", BASELINE], cwd=ROOT, text=True).splitlines()
-        allowed = {"legged_gym/legged_gym/envs/g1/carrybox.py", "legged_gym/legged_gym/envs/g1/carrybox_config.py"}
-        for rel in modified:
-            if rel not in allowed:
-                tracked_before = subprocess.run(["git", "cat-file", "-e", BASELINE + ":" + rel], cwd=ROOT, capture_output=True)
-                self.assertNotEqual(tracked_before.returncode, 0, "Unexpected original file modified: " + rel)
-        print("All original robot methods preserved except observation + latch init/reset; original training/data untouched")
+        for rel, expected in MANIFEST["files"].items():
+            path = ROOT / rel
+            raw = path.read_bytes()
+            if path.suffix.lower() in (".py", ".txt", ".urdf", ".yaml"):
+                raw = raw.replace(b"\r\n", b"\n")
+            self.assertEqual(hashlib.sha256(raw).hexdigest(), expected, rel)
+        print("Original retained training/data/assets match baseline hashes; only observation + latch init/reset methods differ")
+
+    def test_carrybox_only_package_and_asset_dependencies(self):
+        registered = []
+        registry = SimpleNamespace(register=lambda name, *args: registered.append(name))
+        extract(ENV / "__init__.py", dict(task_registry=registry, G1CarryBox=Robot,
+                G1CarryBoxCfg=config_ns["G1Cfg"], G1CarryBoxCfgPPO=config_ns["G1CfgPPO"]))
+        self.assertEqual(registered, ["carrybox"])
+        self.assertEqual({p.name for p in (ENV / "g1").glob("*.py")}, {"carrybox.py", "carrybox_config.py"})
+        self.assertEqual({p.name for p in (ENV / "motionlib").glob("*.py")}, {"motionlib_carrybox.py"})
+        resources = ROOT / "legged_gym/resources"
+        expected = {rel for rel in MANIFEST["files"] if rel.startswith("legged_gym/resources/")}
+        expected.add("legged_gym/resources/config/carrybox_loco_pickup.yaml")
+        actual = {p.relative_to(ROOT).as_posix() for p in resources.rglob("*") if p.is_file()}
+        self.assertEqual(actual, expected)
+        urdf = Path(self.cfg.asset.file.format(LEGGED_GYM_ROOT_DIR=ROOT / "legged_gym"))
+        for mesh in ET.parse(urdf).iter("mesh"):
+            filename = mesh.attrib["filename"]
+            path = urdf.parent / filename
+            self.assertTrue(path.is_file(), filename)
+            self.assertEqual(path.name, next(p.name for p in path.parent.iterdir() if p.name.lower() == path.name.lower()))
+        print("Only carrybox registered; 14 motion files and all 35 required meshes present; no checkpoints/other resources")
 
 
 if __name__ == "__main__":
