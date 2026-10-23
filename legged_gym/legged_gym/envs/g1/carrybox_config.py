@@ -168,8 +168,8 @@ class G1Cfg(LeggedRobotCfg):
             reset_mode = 'hybrid' # 'default', 'random', 'hybrid'
             hybrid_init_prob = 0.8  # prob of random, for hybrid mode
 
-            skill = ["loco", "pickUp", "carryWith", "putDown"]
-            skill_init_prob = [0.8, 0.2, 0.2, 0.0]
+            skill = ["loco", "pickUp"]
+            skill_init_prob = [0.8, 0.2]
 
             box_termination = False
             min_tar_dist = 0.5
@@ -248,8 +248,8 @@ class G1Cfg(LeggedRobotCfg):
             ## task rewards
             walk_task = 1.0
             carryup_task = 1.0
-            relocation_task = 1.0
-            standup_task = 0.2
+            relocation_task = 0.0
+            standup_task = 0.0
 
         # walk
         robot2object_pos = 0.0
@@ -303,7 +303,7 @@ class G1Cfg(LeggedRobotCfg):
             end_effector = 0.05
 
     class dataset:
-        motion_file = "{LEGGED_GYM_ROOT_DIR}/resources/config/carrybox.yaml"
+        motion_file = "{LEGGED_GYM_ROOT_DIR}/resources/config/carrybox_loco_pickup.yaml"
         joint_mapping_file = "{LEGGED_GYM_ROOT_DIR}/resources/config/joint_id.txt"
         frame_rate = 60
         min_time = 0.1 # [s]
@@ -352,8 +352,8 @@ class G1CfgPPO( LeggedRobotCfgPPO ):
 
         # logging
         save_interval = 500 # check for potential saves every this many iterations
-        run_name = 'carrybox_coef0.25'
-        experiment_name = 'amp_carrybox'
+        run_name = 'loco_pickup_scratch_coef0.25'
+        experiment_name = 'minimal_carrybox'
         logger = 'tensorboard'  # ['tensorboard', 'wandb']
         wandb_project = 'amp_carrybox'
         wandb_entity = 'YOUR_ENTITY_NAME'  # set to your wandb entity name here
