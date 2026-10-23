@@ -1,39 +1,28 @@
-<h1 align="center"> PhysHSI: Towards a Real-World Generalizable and Natural Humanoid-Scene Interaction System </h1>
+# PhysHSI CarryBox — Loco + PickUp
 
-<p align="center">
-  <a href='https://why618188.github.io/' target='_blank'>Huayi Wang*</a>,
-  <a href='https://zwt006.github.io/' target='_blank'>Wentao Zhang*</a>,
-  <a href='https://ingrid789.github.io/IngridYu/' target='_blank'>Runyi Yu*</a>,
-  <a href="https://taohuang13.github.io/">Tao Huang</a>,
-  <a href="https://renjunli99.github.io/">Junli Ren</a>,
-  <a href="https://trap-1.github.io/">Feiyu Jia</a>,
-  <a href="https://openreview.net/profile?id=%7EZiRui_Wang4">Zirui Wang</a>,
-  <br>
-  <a href="https://why618188.github.io/physhsi/">Xiaojie Niu</a>,
-  <a href="https://xiao-chen.tech/">Xiao Chen</a>,
-  <a href="https://jiahe-chen.cn/">Jiahe Chen</a>,
-  <a href="https://cqf.io/">Qifeng Chen<sup>&dagger;</sup></a>,
-  <a href="https://wangjingbo1219.github.io/">Jingbo Wang<sup>&dagger;</sup></a>,
-  <a href='https://oceanpang.github.io/' target='_blank'>Jiangmiao Pang<sup>&dagger;</sup></a>
-  <br>
-  *Equal Contributions&nbsp;&nbsp;&nbsp;&nbsp;<sup>&dagger;</sup>Corresponding Authors
-  <br>
-</p>
+这是 [官方 PhysHSI](https://github.com/InternRobotics/PhysHSI) 的 CarryBox 专用精简分支。
+仅保留 `--task carrybox`：Approach → PickUp，不含 Stand Hold。
 
-<p align="center">
-  <a href="https://arxiv.org/abs/2510.11072"><img src="https://img.shields.io/badge/arXiv-2510.11072-brown" alt="arXiv"></a>
-  <a href="https://youtu.be/dTj6FjoQ5u0"><img src="https://img.shields.io/badge/Youtube-🎬-yellow" alt="YouTube"></a>
-  <a href="https://why618188.github.io/physhsi/"><img src="https://img.shields.io/badge/Website-%F0%9F%9A%80-green" alt="Website"></a>
-  <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/"><img src="https://img.shields.io/badge/License-CC%20BY--NC--SA%204.0-lightgrey.svg" alt="License: CC BY-NC-SA 4.0"></a>
-</p>
+- 保留原始 PPO/AMP/Hybrid RSI、共享训练库、G1 URDF 及其引用的 35 个 mesh。
+- 保留 11 条 loco + 3 条 pickUp motion，以及原始内容、路径和权重。
+- 已删除全部预训练 policy checkpoint（包括原 CarryBox 模型）、其他任务及数据、CarryWith/PutDown motion、无关物体和未引用网格。
+- 新策略需从零训练；查看器使用你自己训练得到的 checkpoint。
 
-<p align="center">
-  <img src="teaser.png" alt="Project teaser" width="100%">
-</p>
+## Ubuntu 快速克隆
 
-## 🛠️ Installation
+必须指定精简分支并浅克隆，避免下载历史中的大文件：
 
-1. Create a conda environment and install PyTorch:
+```bash
+git clone --depth 1 --single-branch --branch codex/minimal-carrybox-loco-pickup https://github.com/Ir1222/PhysHSI.git PhysHSI-carrybox
+cd PhysHSI-carrybox
+```
+
+删除文件的新提交保留了之前的修改记录；普通完整 clone 仍会下载旧 checkpoint 的历史对象。
+浅克隆只带最新提交，本地仍可继续 commit/push；完整历史可以在 GitHub 查看，必要时用 `git fetch --unshallow` 获取。
+
+## 安装
+
+在支持 Isaac Gym Preview 4 的 Linux + CUDA 环境安装：
 
 ```bash
 conda create -n physhsi python=3.8
@@ -41,111 +30,52 @@ conda activate physhsi
 pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu118
 ```
 
-2. Install Isaac Gym:
-- Download and install Isaac Gym Preview 4 from [NVIDIA Developer](https://developer.nvidia.com/isaac-gym).
-- Navigate to its Python folder and install.
-  ```bash
-  cd isaacgym/python && pip install -e .
-  ```
+从 NVIDIA 安装 Isaac Gym Preview 4，在其 `python` 目录运行 `pip install -e .`。
+回到本仓库根目录：
 
-3. Clone this repository.
 ```bash
-git clone https://github.com/InternRobotics/PhysHSI.git
-cd PhysHSI
+pip install -e rsl_rl
+pip install -e legged_gym
+pip install -r requirements.txt
+python experiments/minimal_carrybox/verify.py
 ```
 
-4. Install PhysHSI.
-```bash
-cd rsl_rl && pip install -e .
-cd ../legged_gym && pip install -e .
-```
+## 训练、查看与日志
 
-5. Install additional dependencies.
-```bash
-cd .. && pip install -r requirements.txt
-```
-
-## 🕹️ Run PhysHSI
-
-PhysHSI supports six tasks for the Unitree G1 humanoid robot: **CarryBox, SitDown, LieDown, StandUp, StyleLoco-Dinosaur,** and **StyleLoco-Highknee**.
-
-### Motion Visualization
-
-Reference motion data for each task can be found in the [motion data folder](legged_gym/resources/dataset/). To visualize reference motion data, run:
+从仓库根目录进入 `legged_gym`：
 
 ```bash
 cd legged_gym
-python legged_gym/scripts/play.py --task [task_name] --play_dataset
+
+# 从零训练（不传 --resume 或旧 checkpoint）
+python legged_gym/scripts/train.py --task carrybox --headless
+
+# 仅查看保留的 14 条 motion
+python legged_gym/scripts/play.py --task carrybox --play_dataset
+
+# 查看本实验最近保存的策略，需先有训练输出
+CHECKPOINT=$(python -c "from pathlib import Path; print(max(Path('logs/minimal_carrybox').glob('*/model_*.pt'), key=lambda p: p.stat().st_mtime).resolve())")
+python legged_gym/scripts/play.py --task carrybox --resume_path "$CHECKPOINT"
+
+tensorboard --logdir logs/minimal_carrybox --port 6006
 ```
 
-Here, `[task_name]` can be one of `[carrybox, liedown, sitdown, standup, styleloco_dinosaur, styleloco_highknee]`.
-
-### Play with Pre-trained Checkpoints
-
-Pre-trained checkpoints for each task are available in the [checkpoint folder](legged_gym/resources/ckpt/). To play a task using a checkpoint, run:
+短环境/训练 smoke test（手动执行）：
 
 ```bash
-python legged_gym/scripts/play.py --task [task_name] --resume_path resources/ckpt/[task_name].pt
+python legged_gym/scripts/train.py --task carrybox --headless --num_envs 16 --max_iterations 2 --run_name loco_pickup_smoke
 ```
 
-For example, to play the CarryBox task:
-```bash
-python legged_gym/scripts/play.py --task carrybox --resume_path resources/ckpt/carrybox.pt
-```
+目前开发机未安装 Isaac Gym；CPU 验证不代表物理仿真或训练收敛已经验证。
 
-> ⚠️ Note:
-> 
-> During the first 1–2 episodes of `play.py`, you may observe slight interpenetration between the robot, the object, or the platform.
-> 
-> This issue only occurs in the initial episodes and does not affect training or subsequent performance.
+## 修改记录与验证
 
-## 🤖 Train PhysHSI
+- [基线设计、奖励、观测及已知限制](experiments/minimal_carrybox/README.md)
+- [本次精简内容与验证](experiments/minimal_carrybox/CLEANUP.md)
+- [Git 修改历史查询](experiments/minimal_carrybox/GIT_GUIDE.md)
+- `original_manifest.json` 存储原始基线的 SHA-256 校验值与 motion 条目；验证无需旧 Git 对象，在浅克隆中也可运行。
 
-### CarryBox
-
-CarryBox is a challenging long-horizon task. We train it in two steps:
-
-1. **Initial training:** Use a relatively small AMP coefficient and relaxed termination conditions for easier learning. Run approximately 20k steps:
-    ```bash
-    python legged_gym/scripts/train.py --task carrybox --headless 
-    ```
-
-2. **Refined training**: To better align with the data, manually increase the AMP coefficient and continue training for about 30~40k steps:
-    ```bash
-    python legged_gym/scripts/train.py --task carrybox_resume --resume --resume_path [ckpt_path] --headless
-    ```
-    Here, `[ckpt_path]` refers to the checkpoint from the first 20k-step training stage.
-
-To play the final trained checkpoint:
-```bash
-python legged_gym/scripts/play.py --task carrybox --resume_path [ckpt_path]
-```
-
-### Other Tasks
-
-For the remaining five tasks, you can directly train them using:
-```bash
-python legged_gym/scripts/train.py --task [task_name] --headless
-```
-Here, `[task_name]` can be one of `[liedown, sitdown, standup, styleloco_dinosaur, styleloco_highknee]`.
-
-To play the final trained checkpoint for any task:
-```bash
-python legged_gym/scripts/play.py --task [task_name] --resume_path [ckpt_path]
-```
-
-> By default, PhysHSI uses **TensorBoard** for logging training metrics.  
-> 
-> If you prefer to use **Weights & Biases (wandb)**, please enable it in the corresponding `[task_name]_config.py` file and set the appropriate `wandb_entity` for your account.
-
-## 👏 Acknowledgements
-
-This repository is built upon the support and contributions of the following open-source projects. Special thanks to:
-
-- [Legged_gym](https://github.com/leggedrobotics/rsl_rl) and [HIMLoco](https://github.com/OpenRobotLab/HIMLoco): The foundation environments for training and running codes.
-- [RSL_RL](https://github.com/leggedrobotics/rsl_rl): Reinforcement learning algorithm implementation.
-- [AMP for Hardware](https://github.com/escontra/AMP_for_hardware) and [TokenHSI](https://github.com/liangpan99/TokenHSI): References for AMP and RSI implementations.
-- [AMASS](https://amass.is.tue.mpg.de/), [SAMP](https://samp.is.tue.mpg.de/) and [100STYLE](https://www.ianxmason.com/100style/): Reference dataset construction.
+原始项目基于 Legged Gym、HIMLoco、RSL-RL、AMP for Hardware 和 TokenHSI；数据来源包括 AMASS、SAMP 和 100STYLE。保留原始许可证与引用如下。
 
 ## 🔗 Citation
 

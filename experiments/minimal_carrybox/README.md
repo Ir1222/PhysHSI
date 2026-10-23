@@ -1,6 +1,7 @@
 # Minimal CarryBox：Loco + PickUp 验证报告
 
 日期：2026-10-23。原始基线：官方 PhysHSI `07bf22b`。
+本文记录最初三个基线实现提交；后续按用户要求进行了 CarryBox 专用精简，删除了未使用的原始文件。当前文件保留情况与验证结果以 [CLEANUP.md](CLEANUP.md) 为准。
 范围：仅 `--task carrybox` 的 Approach → PickUp；不包含 Stand Hold。
 附件末尾的“不提交/推送”按用户当前明确的 commit/push 请求覆盖；没有启动长训练。
 

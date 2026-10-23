@@ -1,5 +1,15 @@
 # 本次修改如何查找
 
+## Ubuntu 快速克隆精简版
+
+```bash
+git clone --depth 1 --single-branch --branch codex/minimal-carrybox-loco-pickup https://github.com/Ir1222/PhysHSI.git PhysHSI-carrybox
+```
+
+必须指定该分支；`main` 仍是官方原始基线。文件删除以新提交记录，没有重写旧历史，因此完整 clone 仍会下载历史里的大文件。浅克隆不含旧提交和基线标签，下面涉及旧提交的查询请在 GitHub 或原始完整工作副本中使用；也可执行 `git fetch --unshallow` 下载完整历史。CPU 验证脚本通过随仓库保存的原始校验清单运行，不依赖这些历史对象。
+
+`209298d` 精简提交删除全部预训练 checkpoint、其他任务及未使用资源，并同步更新任务注册、查看器和验证；随后另一个 docs 提交保存 Ubuntu 浅克隆说明与精简报告。
+
 工作分支：`codex/minimal-carrybox-loco-pickup`。
 
 - `origin`：你的 fork，<https://github.com/Ir1222/PhysHSI>，后续修改推送到这里。
