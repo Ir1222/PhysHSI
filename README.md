@@ -22,23 +22,77 @@ cd PhysHSI-carrybox
 
 ## 安装
 
-在支持 Isaac Gym Preview 4 的 Linux + CUDA 环境安装：
+Ubuntu 上已有可运行的 `physhsi` 环境时，优先克隆依赖到独立环境，再将项目包重新绑定到本仓库。无需重新下载整套 PyTorch/CUDA 或 Isaac Gym 安装包：
 
 ```bash
-conda create -n physhsi python=3.8
-conda activate physhsi
-pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+conda activate base
+conda create -n physhsi_carrybox --clone physhsi -y
+conda activate physhsi_carrybox
+unset PYTHONPATH
 ```
 
-从 NVIDIA 安装 Isaac Gym Preview 4，在其 `python` 目录运行 `pip install -e .`。
-回到本仓库根目录：
+Conda 会复用本机已有文件和缓存；个别缓存缺失的文件可能仍需下载。环境克隆不等于迁移源码：旧 editable 安装可能仍指向旧仓库，因此必须执行下文的重新安装。
+旧 `physhsi` 环境保留；新环境名不能已经存在。若前面已创建过 `physhsi_carrybox`，先检查它，或换一个未使用的名字，避免覆盖。
+
+在克隆后的环境先确认 GPU 和 Isaac Gym 可用（Isaac Gym 必须先于 torch 导入）：
 
 ```bash
-pip install -e rsl_rl
-pip install -e legged_gym
-pip install -r requirements.txt
+python -c "import isaacgym; import torch; print(torch.__version__); print(torch.cuda.is_available())"
+```
+
+成功即可跳过 Isaac Gym 解压和重装。已有本地安装包或解压目录同样可复用；不需要重新下载 Preview 4。
+
+进入精简仓库根目录（路径按实际 clone 位置调整），固定当前环境已有的核心依赖版本，再补齐 requirements：
+
+```bash
+cd ~/projects/PhysHSI-carrybox
+
+python - <<'PY'
+from importlib.metadata import PackageNotFoundError, version
+from pathlib import Path
+import sys
+constraints = []
+for name in ('torch', 'torchvision', 'numpy', 'scipy', 'setuptools'):
+    try:
+        constraints.append(f'{name}=={version(name)}')
+    except PackageNotFoundError:
+        pass
+path = Path(sys.prefix) / 'physhsi-migration-constraints.txt'
+path.write_text('\n'.join(constraints) + '\n')
+print(path.read_text())
+PY
+
+python -m pip install -r requirements.txt -c "$CONDA_PREFIX/physhsi-migration-constraints.txt"
+
+# 只重装本仓库的两个代码包，保留已有依赖和构建工具版本
+python -m pip install --force-reinstall --no-deps --no-build-isolation -e ./rsl_rl -e ./legged_gym
+python -m pip check
+
+python - <<'PY'
+import sys
+from pathlib import Path
+import isaacgym
+import torch
+import legged_gym
+import rsl_rl
+from legged_gym.envs import task_registry
+root = Path.cwd().resolve()
+print('Python:', sys.executable)
+for package in (legged_gym, rsl_rl):
+    path = Path(package.__file__).resolve()
+    print(package.__name__, path)
+    assert root in path.parents, '仍指向旧仓库，请检查 editable 安装和 PYTHONPATH'
+print('Tasks:', list(task_registry.task_classes))
+assert list(task_registry.task_classes) == ['carrybox']
+assert torch.cuda.is_available(), '当前环境不能使用 CUDA'
+PY
+
 python experiments/minimal_carrybox/verify.py
 ```
+
+这里 `requirements.txt` 保留原 NumPy 1.23.5 要求，只补充显式使用的 PyYAML、GitPython 和 Ninja。已经满足要求的包通常无需重装；不要加 `--upgrade`。
+若约束冲突，先核对原环境版本和报错，不要直接升级整套依赖。
+若没有可用的旧环境，才需要按原始 PhysHSI 的 Python 3.8 + Isaac Gym Preview 4 安装流程新建；本文迁移命令没有在用户的 Ubuntu 主机上执行。
 
 ## 训练、查看与日志
 

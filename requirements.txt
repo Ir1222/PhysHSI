@@ -2,6 +2,10 @@ ipdb
 keyboard
 muon_optimizer
 numpy==1.23.5
+# Explicit imports/build tools; normally already present in a working environment.
+pyyaml
+gitpython
+ninja
 onnx
 onnxruntime
 pydelatin
