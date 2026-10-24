@@ -248,6 +248,7 @@ class G1Cfg(LeggedRobotCfg):
             ## task rewards
             walk_task = 1.0
             carryup_task = 1.0
+            pickup_success = 1.0
             relocation_task = 0.0
             standup_task = 0.0
 

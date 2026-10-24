@@ -52,7 +52,9 @@ class BaselineChecks(unittest.TestCase):
     def test_configuration_and_rewards(self):
         cfg = self.cfg
         self.assertEqual(cfg.asset.box.skill, ["loco", "pickUp"])
-        self.assertEqual(cfg.asset.box.skill_init_prob, [0.8, 0.2])
+        self.assertEqual(len(cfg.asset.box.skill_init_prob), len(cfg.asset.box.skill))
+        self.assertTrue(all(p >= 0 for p in cfg.asset.box.skill_init_prob))
+        self.assertAlmostEqual(sum(cfg.asset.box.skill_init_prob), 1.)
         self.assertEqual((cfg.asset.box.reset_mode, cfg.asset.box.hybrid_init_prob), ("hybrid", 0.8))
         self.assertEqual((cfg.env.num_actor_obs, cfg.env.num_privileged_obs,
                           cfg.env.num_task_obs, cfg.env.num_actions, cfg.env.num_actor_history), (738, 126, 15, 29, 6))
@@ -64,7 +66,7 @@ class BaselineChecks(unittest.TestCase):
         obj.cfg, obj.sim_params, obj.num_envs, obj.device = cfg, SimpleNamespace(dt=cfg.sim.dt), 4, "cpu"
         obj._parse_cfg(cfg)
         obj._prepare_reward_function()
-        expected = {"walk_task": 1., "carryup_task": 1., "dof_acc": -1e-7,
+        expected = {"walk_task": 1., "carryup_task": 1., "pickup_success": 1., "dof_acc": -1e-7,
                     "action_rate": -.03, "torques": -1e-4, "dof_vel": -2e-4,
                     "dof_pos_limits": -5., "dof_vel_limits": -1e-3, "torque_limits": -.03}
         self.assertEqual(set(obj.reward_names), set(expected))
@@ -73,7 +75,9 @@ class BaselineChecks(unittest.TestCase):
         self.assertEqual((cfg.rewards.scales.relocation_task, cfg.rewards.scales.standup_task), (0., 0.))
         print("\nNonzero config scales:", expected)
         print("Parsed effective scales (dt=0.02):", obj.reward_scales)
-        print("Expected reset distribution: default=20%, loco RSI=64%, pickUp RSI=16%")
+        ref_prob = cfg.asset.box.hybrid_init_prob
+        print("Expected reset distribution: default={:.0%}, loco RSI={:.0%}, pickUp RSI={:.0%}".format(
+            1 - ref_prob, *(ref_prob * p for p in cfg.asset.box.skill_init_prob)))
 
     def make_robot(self):
         obj = Robot.__new__(Robot)
@@ -83,6 +87,7 @@ class BaselineChecks(unittest.TestCase):
         obj.box_states = torch.zeros(4, 13)
         obj.box_states[:, 0] = torch.tensor([1., .5, .7, 2.])
         obj.box_states[:, 6] = 1.
+        obj.episode_max_box_height = obj.box_states[:, 2].clone()
         obj.rigid_body_states = obj.root_states[:, None, :].clone()
         obj.rigid_body_states[:, :, 6] = 1.
         obj._box_size = torch.tensor([[.3, .3, .25]]).repeat(4, 1)
@@ -116,11 +121,25 @@ class BaselineChecks(unittest.TestCase):
                 setattr(obj.cfg.domain_rand, key, False)
             for name in ("_reset_actors", "_reset_boxes", "_reset_task", "_reset_env_tensors"):
                 setattr(obj, name, lambda ids: None)
+            obj.episode_max_box_height[:] = torch.tensor([.8, .9, 1., 1.1])
+            def reset_boxes(ids):
+                self.assertAlmostEqual(obj.extras["episode"]["box_height"].item(), .9)
+                obj.box_states[ids, 2] = .4
+            obj._reset_boxes = reset_boxes
             for name in ("last_actions", "last_last_actions", "last_dof_vel", "last_torques", "feet_air_time", "joint_powers", "reset_buf", "episode_length_buf", "time_out_buf", "hfov_rad", "vfov_rad", "facing_angle"):
                 setattr(obj, name, torch.zeros(4))
             obj.dof_pos, obj.default_dof_pos, obj.delay_buffer = torch.zeros(4, 29), torch.zeros(29), torch.zeros(5, 4, 29)
-            obj.episode_sums, obj.extras = {}, {}
+            obj.dt = .02
+            obj.episode_length_buf[:] = 2
+            obj.episode_sums = {"pickup_success": torch.tensor([0., .04, 0., 0.])}
+            obj.extras = {}
             obj.reset_idx(torch.tensor([1]))
+            self.assertEqual(set(obj.extras["episode"]), {"box_height", "rew_pickup_success"})
+            self.assertAlmostEqual(obj.extras["episode"]["rew_pickup_success"].item(), 1.)
+            torch.testing.assert_close(obj.episode_max_box_height, torch.tensor([.8, .4, 1., 1.1]))
+            self.assertEqual(obj.episode_sums["pickup_success"][1].item(), 0.)
+            obj.reset_idx(torch.tensor([], dtype=torch.long))
+            torch.testing.assert_close(obj.episode_max_box_height, torch.tensor([.8, .4, 1., 1.1]))
             self.assertFalse(obj.has_reached_box[1])
             torch.testing.assert_close(obj.compute_task_observations()[0][1, -3:], torch.tensor([.85, 0., 0.]))
             obj.box_states[1, 0] = .1  # nearby RSI state should stop immediately
@@ -138,6 +157,48 @@ class BaselineChecks(unittest.TestCase):
             terminal = obj.compute_termination_observations(torch.tensor([0, 1]))
             self.assertEqual(tuple(terminal.shape), (2, 126))
             torch.testing.assert_close(obj.obs_buf[:, -3:], obj.privileged_obs_buf[:, -3:])
+
+    def test_sparse_pickup_and_episode_height(self):
+        obj = self.make_robot()
+        cases = [(left, right, height) for left in (0., 1., 2.)
+                 for right in (0., 1., 2.) for height in (.6, .72, .73)]
+        obj.box_states = torch.zeros(len(cases), 13)
+        obj.contact_forces = torch.zeros(len(cases), 5, 3)
+        obj.hand_colli_indices = torch.tensor([1, 3])
+        for i, (left, right, height) in enumerate(cases):
+            obj.contact_forces[i, 1, 0] = -left
+            obj.contact_forces[i, 3, 2] = right
+            obj.box_states[i, 2] = height
+        expected = torch.zeros(len(cases))
+        expected[-1] = 1.  # only both forces > 1 N and height > 0.72 m
+        torch.testing.assert_close(obj._reward_pickup_success(), expected)
+        torch.testing.assert_close(obj._reward_pickup_success(), expected)  # per step, no latch
+        obj.contact_forces[-1, 1] = torch.tensor([.8, .8, 0.])
+        torch.testing.assert_close(obj._reward_pickup_success(), expected)  # vector norm
+
+        # Execute the actual peak init/update statements without Isaac Gym.
+        source = (ENV / "g1/carrybox.py").read_text(encoding="utf-8")
+        cls = next(n for n in ast.parse(source).body if isinstance(n, ast.ClassDef))
+        for name in ("_init_buffers", "post_physics_step"):
+            method = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == name)
+            stmt = next(n for n in method.body if isinstance(n, ast.Assign)
+                        and "episode_max_box_height" in ast.get_source_segment(source, n.targets[0]))
+            code = compile(ast.Module(body=[stmt], type_ignores=[]), name, "exec")
+            if name == "_init_buffers":
+                exec(code, {"self": obj, "torch": torch})
+                obj.box_states[:, 2] += .1
+            else:
+                exec(code, {"self": obj, "torch": torch})
+                obj.box_states[:, 2] -= .2
+                exec(code, {"self": obj, "torch": torch})
+                self.assertLess(method.body.index(stmt), next(i for i, n in enumerate(method.body)
+                    if isinstance(n, ast.Expr) and "self.reset_idx(" in ast.get_source_segment(source, n)))
+        torch.testing.assert_close(obj.episode_max_box_height, obj.box_states[:, 2] + .2)
+        urdf = Path(self.cfg.asset.file.format(LEGGED_GYM_ROOT_DIR=ROOT / "legged_gym"))
+        hands = [n.attrib["name"] for n in ET.parse(urdf).iter("link")
+                 if self.cfg.asset.hand_colli_name in n.attrib["name"]]
+        self.assertEqual(hands, ["left_rubber_hand", "right_rubber_hand"])
+        self.assertFalse(self.cfg.asset.collapse_fixed_joints)
 
     def test_real_motionlib_and_expert_sampling(self):
         old = MANIFEST["motions"]
@@ -172,15 +233,16 @@ class BaselineChecks(unittest.TestCase):
         b = {n.name: hashlib.sha256(ast.get_source_segment(after, n).encode()).hexdigest()
              for n in cls.body if isinstance(n, ast.FunctionDef)}
         changed = {name for name in a if a[name] != b[name]}
-        self.assertEqual(changed, {"compute_task_observations", "reset_idx", "_init_buffers"})
-        self.assertEqual(set(a), set(b))
+        self.assertEqual(changed, {"compute_task_observations", "reset_idx", "_init_buffers", "post_physics_step"})
+        self.assertEqual(set(b) - set(a), {"_reward_pickup_success"})
+        self.assertTrue(set(a) <= set(b))
         for rel, expected in MANIFEST["files"].items():
             path = ROOT / rel
             raw = path.read_bytes()
             if path.suffix.lower() in (".py", ".txt", ".urdf", ".yaml"):
                 raw = raw.replace(b"\r\n", b"\n")
             self.assertEqual(hashlib.sha256(raw).hexdigest(), expected, rel)
-        print("Original retained training/data/assets match baseline hashes; only observation + latch init/reset methods differ")
+        print("Original training/data/assets/rewards preserved; only observation, init/reset and peak-height tracking differ")
 
     def test_carrybox_only_package_and_asset_dependencies(self):
         registered = []

@@ -196,6 +196,8 @@ class LeggedRobot(BaseTask):
         self.gym.refresh_net_contact_force_tensor(self.sim)
         self.gym.refresh_rigid_body_state_tensor(self.sim)
 
+        self.episode_max_box_height[:] = torch.maximum(self.episode_max_box_height, self.box_states[:, 2])
+
         self.episode_length_buf += 1
         self.common_step_counter += 1
 
@@ -319,6 +321,7 @@ class LeggedRobot(BaseTask):
         """
         if len(env_ids) == 0:
             return
+        self.extras["episode"] = {"box_height": torch.mean(self.episode_max_box_height[env_ids])}
         if self.cfg.commands.curriculum and (self.common_step_counter % self.max_episode_length==0):
             self.update_command_curriculum(env_ids)
         if self.cfg.env.action_curriculum and (self.common_step_counter % self.max_episode_length==0):
@@ -333,6 +336,7 @@ class LeggedRobot(BaseTask):
             self._reset_boxes(env_ids)
             self._reset_task(env_ids)
         self._reset_env_tensors(env_ids)
+        self.episode_max_box_height[env_ids] = self.box_states[env_ids, 2]
 
         # reset buffers
         self.has_reached_box[env_ids] = False
@@ -362,7 +366,6 @@ class LeggedRobot(BaseTask):
         self.facing_angle[env_ids] = torch_rand_float(self.camera_cfg.facing_angle[0], self.camera_cfg.facing_angle[1], (len(env_ids), 1), device=self.device).squeeze(1)
 
         # fill extras
-        self.extras["episode"] = {}
         for key in self.episode_sums.keys():
             self.extras["episode"]['rew_' + key] = torch.mean(self.episode_sums[key][env_ids] / torch.clip(self.episode_length_buf[env_ids], min=1) / self.dt)
             self.episode_sums[key][env_ids] = 0.
@@ -1067,6 +1070,7 @@ class LeggedRobot(BaseTask):
         all_states = gymtorch.wrap_tensor(actor_root_state).view(self.num_envs, 4, 13)
         self.all_states = gymtorch.wrap_tensor(actor_root_state)
         self.platform_states, self.tar_platform_states, self.box_states, self.root_states = all_states[:, 0], all_states[:, 1], all_states[:, 2], all_states[:, 3]
+        self.episode_max_box_height = self.box_states[:, 2].clone()
         self.platform_pos = self.platform_states[..., :3]
         self.platform_default_pos = self.platform_pos.clone()
         self.tar_platform_pos = self.tar_platform_states[..., :3]
@@ -1999,6 +2003,13 @@ class LeggedRobot(BaseTask):
         carryup_reward[self.robot2object_dist > self.cfg.rewards.thresh_robot2object] = 0.
         carryup_reward[self.object2goal_dist_xyz < self.cfg.rewards.thresh_object2goal] = self.cfg.rewards.hand_pos + self.cfg.rewards.box_height
         return carryup_reward
+
+    def _reward_pickup_success(self):
+        hand_contact = torch.norm(self.contact_forces[:, self.hand_colli_indices], dim=-1) > 1.0
+        bilateral_contact = torch.all(hand_contact, dim=-1)
+        box_height_success = self.box_states[:, 2] > self.cfg.rewards.target_box_height
+        pickup_success = bilateral_contact & box_height_success
+        return pickup_success.float()
 
     def _reward_relocation_task(self):
         forward = quat_apply(self.base_quat, self.forward_vec)
