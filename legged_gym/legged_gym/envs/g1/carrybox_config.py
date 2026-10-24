@@ -169,7 +169,7 @@ class G1Cfg(LeggedRobotCfg):
             hybrid_init_prob = 0.8  # prob of random, for hybrid mode
 
             skill = ["loco", "pickUp"]
-            skill_init_prob = [0.8, 0.2]
+            skill_init_prob = [0.6, 0.4]
 
             box_termination = False
             min_tar_dist = 0.5
