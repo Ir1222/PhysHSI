@@ -336,6 +336,7 @@ class LeggedRobot(BaseTask):
             self._reset_boxes(env_ids)
             self._reset_task(env_ids)
         self._reset_env_tensors(env_ids)
+        self.box_height_at_reset[env_ids] = self.box_states[env_ids, 2]
         self.episode_max_box_height[env_ids] = self.box_states[env_ids, 2]
 
         # reset buffers
@@ -1070,6 +1071,7 @@ class LeggedRobot(BaseTask):
         all_states = gymtorch.wrap_tensor(actor_root_state).view(self.num_envs, 4, 13)
         self.all_states = gymtorch.wrap_tensor(actor_root_state)
         self.platform_states, self.tar_platform_states, self.box_states, self.root_states = all_states[:, 0], all_states[:, 1], all_states[:, 2], all_states[:, 3]
+        self.box_height_at_reset = self.box_states[:, 2].clone()
         self.episode_max_box_height = self.box_states[:, 2].clone()
         self.platform_pos = self.platform_states[..., :3]
         self.platform_default_pos = self.platform_pos.clone()
@@ -2003,6 +2005,19 @@ class LeggedRobot(BaseTask):
         carryup_reward[self.robot2object_dist > self.cfg.rewards.thresh_robot2object] = 0.
         carryup_reward[self.object2goal_dist_xyz < self.cfg.rewards.thresh_object2goal] = self.cfg.rewards.hand_pos + self.cfg.rewards.box_height
         return carryup_reward
+
+    def _reward_pickup_contact(self):
+        hand_contact = (torch.norm(self.contact_forces[:, self.hand_colli_indices], dim=-1) > 1.0).float()
+        near_box = self.robot2object_dist < self.cfg.rewards.thresh_robot2object
+        return near_box * hand_contact.sum(dim=-1) / 2.0
+
+    def _reward_pickup_lift_progress(self):
+        hand_contact = (torch.norm(self.contact_forces[:, self.hand_colli_indices], dim=-1) > 1.0).float()
+        near_box = self.robot2object_dist < self.cfg.rewards.thresh_robot2object
+        delta_h = torch.clamp(self.box_states[:, 2] - self.box_height_at_reset, min=0.0)
+        lift_progress = torch.clamp(delta_h / 0.30, min=0.0, max=1.0)
+        contact_weight = 0.25 * hand_contact.sum(dim=-1) + 0.5 * hand_contact[:, 0] * hand_contact[:, 1]
+        return near_box * contact_weight * lift_progress
 
     def _reward_pickup_success(self):
         hand_contact = torch.norm(self.contact_forces[:, self.hand_colli_indices], dim=-1) > 1.0

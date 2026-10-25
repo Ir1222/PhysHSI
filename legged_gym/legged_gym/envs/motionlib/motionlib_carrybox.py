@@ -107,6 +107,10 @@ class MotionLib:
         self.motion_base_pos = torch.zeros(self.tot_frames, 3, dtype=torch.float, device=self.device)
         self.motion_box_pos = torch.zeros(self.tot_frames, 3, dtype=torch.float, device=self.device)
         self.motion_box_pos_global = torch.zeros(self.tot_frames, 3, dtype=torch.float, device=self.device)
+        # Optional measured object rotation in synthesized/recorded hold clips.
+        # Legacy motions retain the original root-heading reconstruction.
+        self.motion_box_quat = torch.zeros(self.tot_frames, 4, dtype=torch.float, device=self.device)
+        self.motion_has_box_quat = torch.zeros(self.tot_frames, dtype=torch.bool, device=self.device)
         self.motion_end_effector_pos = torch.zeros(self.tot_frames, len(self.end_effector_name), 3, dtype=torch.float, device=self.device)
         self.motion_base_z_bias = torch.zeros(self.tot_frames, 1, dtype=torch.float, device=self.device)
         self.contact_index = torch.zeros(self.num_motion['pickUp'], dtype=torch.long, device=self.device)
@@ -120,6 +124,9 @@ class MotionLib:
                 self.motion_base_height[start:end] = traj["base_height"].reshape(-1, 1).clone().detach()
                 self.motion_base_quat[start:end] = traj["base_quat"].clone().detach()
                 self.motion_base_pos[start:end] = traj["base_position"].clone().detach()
+                if "box_quat" in traj:
+                    self.motion_box_quat[start:end] = traj["box_quat"].clone().detach()
+                    self.motion_has_box_quat[start:end] = True
 
                 self.motion_base_z_bias[start:end] = self.motion_base_pos[start:end, 2:3] - self.motion_base_height[start:end]
 
@@ -228,6 +235,12 @@ class MotionLib:
         box_quat = w0 * root_quat_0 + w1 * root_quat_1
         box_quat = torch.nn.functional.normalize(box_quat, dim=-1)
         box_quat = torch_utils.calc_heading_quat(box_quat)
+
+        has_object_rotation = self.motion_has_box_quat[time0] & self.motion_has_box_quat[time1]
+        quat0, quat1 = self.motion_box_quat[time0], self.motion_box_quat[time1]
+        quat0 = torch.where(torch.sum(quat0 * quat1, dim=-1, keepdim=True) < 0, -quat0, quat0)
+        measured_quat = torch.nn.functional.normalize(w0 * quat0 + w1 * quat1, dim=-1)
+        box_quat = torch.where(has_object_rotation.unsqueeze(-1), measured_quat, box_quat)
 
         if skill == "pickUp":
             is_set_platform = motion_times < self.contact_index[motion_ids]
