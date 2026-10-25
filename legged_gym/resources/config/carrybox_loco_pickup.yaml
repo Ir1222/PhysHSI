@@ -44,3 +44,17 @@ motions:
     - file: ../dataset/dataset_carrybox/pickUp/pickup3.pt
       rsi_skipped_range: []
       weight: 4.0
+
+  hold:
+    - file: ../dataset/dataset_carrybox/hold_synthetic/hold_carrywith1.pt
+      rsi_skipped_range: []
+      weight: 1.0
+    - file: ../dataset/dataset_carrybox/hold_synthetic/hold_carrywith2.pt
+      rsi_skipped_range: []
+      weight: 1.0
+    - file: ../dataset/dataset_carrybox/hold_synthetic/hold_pickup2.pt
+      rsi_skipped_range: []
+      weight: 1.0
+    - file: ../dataset/dataset_carrybox/hold_synthetic/hold_pickup3.pt
+      rsi_skipped_range: []
+      weight: 1.0

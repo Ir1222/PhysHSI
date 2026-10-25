@@ -844,7 +844,7 @@ class LeggedRobot(BaseTask):
             self._reset_default(default_reset_ids)
 
     def _reset_boxes(self, env_ids):
-        for sk_name in ["pickUp", "carryWith", "putDown"]:
+        for sk_name in ["pickUp", "carryWith", "putDown", "hold"]:
             if (self._reset_ref_env_ids.get(sk_name) is None) or (len(self._reset_ref_env_ids[sk_name]) == 0):
                 continue
             curr_env_ids = self._reset_ref_env_ids[sk_name]
@@ -941,7 +941,7 @@ class LeggedRobot(BaseTask):
         random_env_ids = []
         if len(self._reset_default_env_ids) > 0:
             random_env_ids.append(self._reset_default_env_ids)
-        for sk_name in ["loco", "pickUp"]:
+        for sk_name in ["loco", "pickUp", "hold"]:
             if self._reset_ref_env_ids.get(sk_name) is not None:
                 random_env_ids.append(self._reset_ref_env_ids[sk_name])
             
@@ -967,6 +967,7 @@ class LeggedRobot(BaseTask):
             self.tar_platform_pos[curr_env_ids, 0:2] = torch.cat((goal_pos_x, goal_pos_y), dim=-1)
             self.tar_platform_pos[curr_env_ids, 2] = goal_pos_z.squeeze(1) - self._box_size[curr_env_ids, 2] / 2 - self._platform_height / 2
             self.goal_pos[curr_env_ids] = torch.cat((goal_pos_x, goal_pos_y, goal_pos_z), dim=-1)
+            self.goal_rot[curr_env_ids] = goal_rot
     
     def _reset_env_tensors(self, env_ids):
         all_states = torch.cat((self.platform_states.unsqueeze(1), 
@@ -1481,6 +1482,8 @@ class LeggedRobot(BaseTask):
             
         hand_pos_names = [s for s in body_names if self.cfg.asset.hand_pos_name in s]
         hand_colli_names = [s for s in body_names if self.cfg.asset.hand_colli_name in s]
+        if len(hand_colli_names) != 2:
+            raise ValueError(f"Expected exactly two hand collision bodies, got {hand_colli_names}")
 
         self.torso_link_index = body_names.index("torso_link")
 
@@ -2025,6 +2028,47 @@ class LeggedRobot(BaseTask):
         box_height_success = self.box_states[:, 2] > self.cfg.rewards.target_box_height
         pickup_success = bilateral_contact & box_height_success
         return pickup_success.float()
+
+    def _reward_hold_contact(self):
+        near_box = self.robot2object_dist < self.cfg.rewards.thresh_robot2object
+        lifted = self.box_states[:, 2] > self.cfg.rewards.target_box_height
+        hold_gate = near_box & lifted
+        hand_contact = torch.norm(self.contact_forces[:, self.hand_colli_indices], dim=-1) > 1.0
+        bilateral_contact = hand_contact.all(dim=-1)
+
+        # Both velocities are in the world frame, as in Carry12's contact reward.
+        robot_vel_xy = self.rigid_body_states[:, self.upper_body_index, 7:9]
+        box_vel_xy = self.box_states[:, 7:9]
+        relative_velocity_error = torch.sum(torch.square(box_vel_xy - robot_vel_xy), dim=-1)
+        relative_velocity_reward = torch.exp(-5.0 * relative_velocity_error)
+        return hold_gate.float() * bilateral_contact.float() * (0.5 + 0.5 * relative_velocity_reward)
+
+    def _reward_hold_base_still(self):
+        near_box = self.robot2object_dist < self.cfg.rewards.thresh_robot2object
+        lifted = self.box_states[:, 2] > self.cfg.rewards.target_box_height
+        hold_gate = near_box & lifted
+        hand_contact = torch.norm(self.contact_forces[:, self.hand_colli_indices], dim=-1) > 1.0
+        bilateral_contact = hand_contact.all(dim=-1)
+
+        robot_vel_xy = self.rigid_body_states[:, self.upper_body_index, 7:9]
+        robot_yaw_rate = self.rigid_body_states[:, self.upper_body_index, 12]
+        stillness_reward = torch.exp(-4.0 * torch.sum(robot_vel_xy ** 2, dim=-1) - robot_yaw_rate ** 2)
+        return hold_gate.float() * bilateral_contact.float() * stillness_reward
+
+    def _reward_hold_box_still(self):
+        near_box = self.robot2object_dist < self.cfg.rewards.thresh_robot2object
+        lifted = self.box_states[:, 2] > self.cfg.rewards.target_box_height
+        hold_gate = near_box & lifted
+        hand_contact = torch.norm(self.contact_forces[:, self.hand_colli_indices], dim=-1) > 1.0
+        bilateral_contact = hand_contact.all(dim=-1)
+
+        box_lin_vel = self.box_states[:, 7:10]
+        box_ang_vel = self.box_states[:, 10:13]
+        box_still_reward = torch.exp(
+            -4.0 * torch.sum(box_lin_vel ** 2, dim=-1)
+            - torch.sum(box_ang_vel ** 2, dim=-1)
+        )
+        return hold_gate.float() * bilateral_contact.float() * box_still_reward
 
     def _reward_relocation_task(self):
         forward = quat_apply(self.base_quat, self.forward_vec)

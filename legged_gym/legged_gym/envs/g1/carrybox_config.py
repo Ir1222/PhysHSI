@@ -168,8 +168,8 @@ class G1Cfg(LeggedRobotCfg):
             reset_mode = 'hybrid' # 'default', 'random', 'hybrid'
             hybrid_init_prob = 0.8  # prob of random, for hybrid mode
 
-            skill = ["loco", "pickUp"]
-            skill_init_prob = [0.6, 0.4]
+            skill = ["loco", "pickUp", "hold"]
+            skill_init_prob = [0.5, 0.4, 0.1]
 
             box_termination = False
             min_tar_dist = 0.5
@@ -251,6 +251,9 @@ class G1Cfg(LeggedRobotCfg):
             pickup_contact = 0.3
             pickup_lift_progress = 1.0
             pickup_success = 1.0
+            hold_contact = 0.5
+            hold_base_still = 0.4
+            hold_box_still = 0.6
             relocation_task = 0.0
             standup_task = 0.0
 
