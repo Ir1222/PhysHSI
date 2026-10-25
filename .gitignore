@@ -74,3 +74,6 @@ __pycache__
 
 # CarryBox baseline: keep pretrained policies out of the lightweight checkout.
 /legged_gym/resources/ckpt/
+
+# Local experiments, reports and generated artifacts stay on this machine.
+/experiments/
