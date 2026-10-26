@@ -1,6 +1,8 @@
 """Frozen Teacher -> physical gate -> Student stand -> smooth SE(2) commands."""
+import argparse
 import csv
 import json
+import sys
 from pathlib import Path
 
 import isaacgym  # Must precede torch on the Isaac Gym training machine.
@@ -36,7 +38,20 @@ def get_args():
         {"name": "--min_clearance", "type": float, "default": .01},
         {"name": "--csv", "type": str, "help": "Optional per-control-step, per-environment diagnostics"},
     ]
-    args = gymutil.parse_arguments(description=__doc__, custom_parameters=parameters)
+    # Isaac Gym's custom-parameter adapter only supports name/type/default/
+    # action/help. Parse our CLI with argparse so choices, required and nargs
+    # retain their normal semantics; forward only Gym's own flags to gymutil.
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
+    for parameter in parameters:
+        parser.add_argument(parameter["name"], **{k: v for k, v in parameter.items() if k != "name"})
+    custom_args, gym_args = parser.parse_known_args()
+    original_argv = sys.argv
+    try:
+        sys.argv = [original_argv[0], *gym_args]
+        args = gymutil.parse_arguments(description=__doc__)
+    finally:
+        sys.argv = original_argv
+    vars(args).update(vars(custom_args))
     args.sim_device = args.rl_device
     args.play_dataset = False
     if args.physics_engine != gymapi.SIM_PHYSX:

@@ -1,11 +1,14 @@
 """CPU tests run the real hooks with tensor fixtures, without importing Isaac Gym."""
+import argparse
 import ast
+import contextlib
+import io
 from pathlib import Path
 import sys
 import tempfile
 import unittest
 from types import SimpleNamespace as NS
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import torch
 from torch import nn
@@ -248,6 +251,59 @@ class HandoffTests(unittest.TestCase):
         torch.testing.assert_close(info["teacher_last_action"], teacher_action)
         torch.testing.assert_close(info["student_first_action"], env.actions)
         torch.testing.assert_close(info["action_discontinuity"], env.actions - teacher_action)
+
+
+class CliTests(unittest.TestCase):
+    def parse(self, arguments):
+        path = ROOT / "legged_gym/legged_gym/scripts/play_mixed_handoff.py"
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        function = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "get_args")
+
+        def gym_parse(description, custom_parameters=()):
+            # Model the restricted Gym adapter: our advanced options must never
+            # reach it. The real Gym parser is unavailable on this CPU host.
+            self.assertFalse(custom_parameters)
+            parser = argparse.ArgumentParser(description=description)
+            parser.add_argument("--sim_device", default="cuda:0")
+            parser.add_argument("--pipeline", default="gpu")
+            parser.add_argument("--physx", dest="physics_engine", action="store_const", const=1, default=1)
+            parser.add_argument("--flex", dest="physics_engine", action="store_const", const=2)
+            return parser.parse_args()
+
+        namespace = {"argparse": argparse, "sys": sys, "gymutil": NS(parse_arguments=gym_parse),
+                     "gymapi": NS(SIM_PHYSX=1), "__doc__": "Mixed handoff"}
+        exec(compile(ast.Module(body=[function], type_ignores=[]), str(path), "exec"), namespace)
+        argv = ["play_mixed_handoff.py", *arguments]
+        with patch.object(sys, "argv", argv):
+            try:
+                return namespace["get_args"]()
+            finally:
+                self.assertIs(sys.argv, argv)
+
+    def test_reported_stand_command(self):
+        args = self.parse(["--teacher_checkpoint", "teacher.pt", "--student_checkpoint", "teacher.pt",
+                           "--allow_legacy_contract", "--mode", "stand", "--num_envs", "1",
+                           "--steps", "3000", "--csv", "logs/handoff_stand.csv"])
+        self.assertEqual(args.mode, "stand")
+        self.assertTrue(args.allow_legacy_contract)
+        self.assertEqual(args.student_checkpoint, "teacher.pt")
+        self.assertEqual(args.csv, "logs/handoff_stand.csv")
+
+    def test_vector_arguments_and_gym_flag_forwarding(self):
+        args = self.parse(["--teacher_checkpoint", "teacher.pt", "--student_checkpoint", "student.pt",
+                           "--mode", "fixed", "--fixed_command", "-0.3", "0.2", "-0.4",
+                           "--command_rates", "0.8", "0.6", "1.2", "--pipeline", "cpu", "--physx"])
+        self.assertEqual(args.fixed_command, [-.3, .2, -.4])
+        self.assertEqual(args.command_rates, [.8, .6, 1.2])
+        self.assertEqual(args.pipeline, "cpu")
+
+    def test_cli_rejects_missing_checkpoints_invalid_mode_and_short_vector(self):
+        base = ["--teacher_checkpoint", "teacher.pt", "--student_checkpoint", "student.pt"]
+        for arguments in ([], base + ["--mode", "invalid"], base + ["--fixed_command", "0", "1"],
+                          base + ["--unknown_gym_flag"]):
+            with self.subTest(arguments=arguments), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    self.parse(arguments)
 
 
 class CheckpointTests(unittest.TestCase):
