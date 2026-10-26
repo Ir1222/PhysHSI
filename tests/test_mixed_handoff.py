@@ -26,14 +26,6 @@ from legged_gym.mixed_handoff import (
 spec = importlib.util.spec_from_file_location("scope2_torch_utils", ROOT / "legged_gym/legged_gym/utils/torch_utils.py")
 MATH = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(MATH)
-student_path = ROOT / "legged_gym/legged_gym/student_carry.py"
-student_tree = ast.parse(student_path.read_text(encoding="utf-8"))
-student_tree.body = [n for n in student_tree.body if not (
-    isinstance(n, ast.ImportFrom) and n.module == "legged_gym.utils.torch_utils")]
-STUDENT = {name: getattr(MATH, name) for name in
-           ("calc_heading_quat", "quat_conjugate", "quat_mul", "quat_rotate_inverse")}
-exec(compile(student_tree, str(student_path), "exec"), STUDENT)
-StudentCarry, StudentCarryCfg = STUDENT["StudentCarry"], STUDENT["StudentCarryCfg"]
 
 
 def classes_from_source(path, names, namespace):
@@ -43,25 +35,44 @@ def classes_from_source(path, names, namespace):
     return namespace
 
 
+# Load real nested configurations without importing the Gym-dependent env package.
+config_namespace = {"inspect": __import__("inspect"), "np": __import__("numpy")}
+classes_from_source(ROOT / "legged_gym/legged_gym/envs/base/base_config.py", ["BaseConfig"], config_namespace)
+classes_from_source(ROOT / "legged_gym/legged_gym/envs/base/legged_robot_config.py",
+                    ["LeggedRobotCfg", "LeggedRobotCfgPPO"], config_namespace)
+classes_from_source(ROOT / "legged_gym/legged_gym/envs/g1/carrybox_config.py", ["G1Cfg"], config_namespace)
+classes_from_source(ROOT / "legged_gym/legged_gym/envs/g1/carrybox_mixed_handoff_config.py",
+                    ["MixedHandoffCfg"], config_namespace)
+MixedHandoffCfg = config_namespace["MixedHandoffCfg"]
+
+
 def environment_fixture(settings=None):
-    # Identity quaternion fixtures: only coordinate-independent history/command
-    # ownership is tested here. Rotation/PhysX contact must be checked in viewer.
+    # Use real quaternion math for rewards; PhysX contacts still need the Viewer.
     namespace = {"torch": torch, "BaseTask": object, "LeggedRobotCfg": object,
-                 "quat_rotate_inverse": lambda q, v: v,
-                 "quat_conjugate": lambda q: q,
-                 "quat_mul": lambda a, b: a,
+                 "quat_rotate_inverse": MATH.quat_rotate_inverse,
+                 "quat_conjugate": MATH.quat_conjugate,
+                 "quat_mul": MATH.quat_mul,
                  "quat_to_tan_norm": lambda q: torch.zeros(len(q), 6)}
     directory = ROOT / "legged_gym/legged_gym/envs/g1"
     classes_from_source(directory / "carrybox.py", ["LeggedRobot"], namespace)
     namespace.update(HandoffSettings=HandoffSettings, HandoffState=HandoffState,
-                     STUDENT_CONTROL=STUDENT_CONTROL, StudentCarry=StudentCarry)
+                     STUDENT_CONTROL=STUDENT_CONTROL, MixedHandoffCfg=MixedHandoffCfg, math=__import__("math"),
+                     calc_heading_quat=MATH.calc_heading_quat)
+    helpers = ast.parse((ROOT / "legged_gym/legged_gym/utils/helpers.py").read_text(encoding="utf-8"))
+    helper = next(n for n in helpers.body if isinstance(n, ast.FunctionDef) and n.name == "class_to_dict")
+    exec(compile(ast.Module(body=[helper], type_ignores=[]), "helpers.py", "exec"), namespace)
+    tree = ast.parse((directory / "carrybox_mixed_handoff.py").read_text())
+    functions = [n for n in tree.body if isinstance(n, ast.FunctionDef)]
+    exec(compile(ast.Module(body=functions, type_ignores=[]), "handoff_helpers.py", "exec"), namespace)
     classes_from_source(directory / "carrybox_mixed_handoff.py", ["MixedHandoff"], namespace)
     env = namespace["MixedHandoff"].__new__(namespace["MixedHandoff"])
     env.num_envs, env.device, env.dt = 2, "cpu", .02
     env.cfg = NS(rewards=NS(thresh_robot2object=.7, target_speed_loco=.85,
                            max_contact_force=350., only_positive_rewards=False,
                            soft_dof_vel_limit=.8, soft_torque_limit=.95),
-                 normalization=NS(clip_actions=100.), student=StudentCarryCfg())
+                 normalization=NS(clip_actions=100.),
+                 student_rewards=MixedHandoffCfg().student_rewards,
+                 student_termination=MixedHandoffCfg().student_termination)
     env.handoff = HandoffState(2, "cpu", env.dt, settings or HandoffSettings())
     env.root_states = torch.zeros(2, 13)
     env.root_states[:, 2] = .8
@@ -109,8 +120,10 @@ def environment_fixture(settings=None):
     env.dof_names = [line.split()[1] for line in (ROOT / "legged_gym/resources/config/joint_id.txt").read_text().splitlines()]
     env.feet_air_time = torch.zeros(2, 2)
     env.first_contacts = torch.zeros(2, 2, dtype=torch.bool)
-    env.student_carry = StudentCarry(env, env.cfg.student, dict(
-        pelvis=0, torso=0, hands=[7, 8], palms=[7, 8], feet=[1, 2], knees=[3, 4]))
+    env.student_body_indices = dict(
+        pelvis=0, torso=0, hands=[7, 8], palms=[7, 8], feet=[1, 2], knees=[3, 4])
+    env._init_student_carry_buffers()
+    env._prepare_student_reward_function()
     env.end_effector_pos = torch.zeros(2, 15)
     env.obs_scales = NS(ang_vel=.25, dof_pos=1., dof_vel=.05, lin_vel=2.)
     env.obs_buf = torch.arange(738.).repeat(2, 1)

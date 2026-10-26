@@ -1,6 +1,7 @@
 # Scope 2: Student carry rewards and failure diagnostics
 
-This extends only `carrybox_mixed_handoff`. It defines rewards for diagnostics
+This extends only `carrybox_mixed_handoff`. For the subsequent behavior-preserving
+file/method migration and numerical comparison, see [native refactor](mixed_handoff_native_refactor.md). It defines rewards for diagnostics
 and later training; neither Actor is updated. Scope 1's checkpoint loader,
 ownership state, physical gate, command distribution/ramp, viewer CLI, PD,
 assets, and 738D/126D/29D contracts are unchanged. No PPO, AMP, storage, rollout
@@ -10,8 +11,10 @@ mask, network, or dataset changes are included.
 
 - `legged_gym/legged_gym/envs/g1/carrybox_mixed_handoff.py`: separate reward
   composition, Student-only failure checks, per-step and episode diagnostics.
-- `legged_gym/legged_gym/student_carry.py`: the small mathematical Carry12 subset
-  and `StudentCarryCfg`; no locomotion environment migration.
+- `legged_gym/legged_gym/envs/g1/carrybox_mixed_handoff_config.py`: native nested
+  Student reward scales, tolerances and termination settings. Mathematical helpers
+  and individual reward methods live in the environment; `student_carry.py` was
+  removed by the behavior-preserving native refactor.
 - `tests/test_mixed_handoff.py`: extend tensor fixtures for Scope 2 while keeping
   the Scope 1 tests and CLI regression cases.
 - `tests/test_student_carry.py`: reward, frame, history and termination tests.
@@ -92,7 +95,7 @@ Source function names refer to the local reference unless marked **current**.
 
 Both tracking sigmas are verified as `.25` in reference `carrybox_config.py`,
 with units `(m/s)²` and `(rad/s)²`. Full arm bounds and all numeric tolerances
-are in `StudentCarryCfg`, copied without retuning. The torso reference XYZW is
+are in `MixedHandoffCfg.student_rewards`, copied without retuning. The torso reference XYZW is
 `[.020052686,.124780931,-.023215466,.991709963]` and is normalized before use.
 Hip order is left roll/yaw then right roll/yaw; waist order is yaw/roll/pitch.
 These and arm ordering are validated; indices are resolved by joint names.
@@ -144,8 +147,8 @@ The drop calculation uses Scope 1's rotation-aware lowest corner and ground
 origin, instead of Carry12's upright `COM_z-half_size_z` approximation. It is
 not the support clearance used by the gate. The grasp grace period plus contact
 filter prevents a single missed sample or empty initialization from terminating
-the first Student step. Configurable values live under `MixedHandoffCfg.student`
-via `StudentCarryCfg`; `terminate_box_tilt=False` is the default.
+the first Student step. Configurable values live under `MixedHandoffCfg.student_rewards` and
+`MixedHandoffCfg.student_termination`; `terminate_box_tilt=False` is the default.
 
 The supplied successful Scope 1 log has tilt `1.7434 rad` (99.89°), exceeding
 70° (1.2217 rad). Thus its *logged tilt* fails the old tilt threshold, and hard
@@ -195,7 +198,7 @@ Run from the repository root:
 
 ```bash
 python -m unittest discover -s tests -v
-python -m compileall -q legged_gym/legged_gym/student_carry.py \
+python -m compileall -q legged_gym/legged_gym/envs/g1/carrybox_mixed_handoff_config.py \
   legged_gym/legged_gym/envs/g1/carrybox_mixed_handoff.py tests
 git diff --check
 ```
