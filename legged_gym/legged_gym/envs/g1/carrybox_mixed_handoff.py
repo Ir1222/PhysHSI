@@ -1,10 +1,11 @@
-"""Independent Scope 1 task. Physics, PD, observations and rewards are inherited."""
+"""Continuous handoff with separate Teacher and Student carry objectives."""
 import torch
 from isaacgym.torch_utils import quat_rotate_inverse
 
 from .carrybox import LeggedRobot
 from .carrybox_config import G1Cfg
 from legged_gym.mixed_handoff import HandoffSettings, HandoffState, STUDENT_CONTROL
+from legged_gym.student_carry import StudentCarry, StudentCarryCfg
 
 
 class MixedHandoffCfg(G1Cfg):
@@ -34,6 +35,9 @@ class MixedHandoffCfg(G1Cfg):
         hand_box_margin = 0.08
         min_clearance = 0.01
 
+    class student(StudentCarryCfg):
+        pass
+
 
 class MixedHandoff(LeggedRobot):
     def __init__(self, *args, **kwargs):
@@ -58,6 +62,12 @@ class MixedHandoff(LeggedRobot):
         self.torso_index = index("torso_link")
         self.gate_hand_indices = [index(side + "_rubber_hand") for side in ("left", "right")]
         self.gate_palm_indices = [index(side + "_palm_link") for side in ("left", "right")]
+        self.student_carry = StudentCarry(self, self.cfg.student, dict(
+            pelvis=index(self.cfg.control.upper_body_link), torso=self.torso_index,
+            palms=self.gate_palm_indices, hands=self.gate_hand_indices,
+            feet=[index(name) for name in self.cfg.student.carry_foot_links],
+            knees=[index(name) for name in self.cfg.student.carry_knee_links],
+        ))
 
     def step(self, actions):
         self.executed_phase = self.handoff.phase.clone()
@@ -102,6 +112,15 @@ class MixedHandoff(LeggedRobot):
         bottom = self.box_states[:, 2] - (vertical_row.abs() * self._box_size / 2).sum(-1)
         support = torch.maximum(self.env_origins[:, 2], self.platform_pos[:, 2] + self._platform_height / 2)
         clearance = bottom - support
+        student = self.executed_phase == STUDENT_CONTROL
+        self.student_carry.update(self, student, surface_distance, bottom)
+        inherited_failure = failure.clone()
+        failure |= self.student_carry.failure
+        self.reset_buf |= self.student_carry.failure
+        # Bit flags retain simultaneous causes: 1 drop, 2 separation, 4 grasp,
+        # 8 enabled tilt, 16 inherited physical failure, 32 horizon timeout.
+        reason = self.student_carry.reason | (16 * (student & inherited_failure).long())
+        reason |= 32 * (student & self.time_out_buf).long()
         first = (self.executed_phase == STUDENT_CONTROL) & (state.student_time == 0)
         teacher = self.executed_phase != STUDENT_CONTROL
         self.teacher_last_action[teacher] = self.actions[teacher]
@@ -144,10 +163,90 @@ class MixedHandoff(LeggedRobot):
             "action_discontinuity_l2": delta.norm(dim=-1),
         }
         self.extras["handoff"] = {k: v.detach().clone() for k, v in measurements.items()}
+        self.extras["handoff"].update({"student/" + k: v.detach().clone()
+                                       for k, v in self.student_carry.metrics.items()})
+        self.extras["handoff"]["student/termination_reason"] = reason.detach().clone()
+
+    def compute_reward(self):
+        # Gate evaluation may already have advanced handoff.phase. Reward
+        # ownership and commands always belong to the action actually executed.
+        student = self.executed_phase == STUDENT_CONTROL
+        teacher = ~student
+        diagnostics = self.extras["handoff"]
+        teacher_total = torch.zeros_like(self.rew_buf)
+        student_total = torch.zeros_like(self.rew_buf)
+        task_total = torch.zeros_like(self.rew_buf)
+        for name, function in zip(self.reward_names, self.reward_functions):
+            raw = torch.where(teacher, function(), 0.)
+            contribution = raw * self.reward_scales[name]  # inherited dt scaling
+            teacher_total += contribution
+            self.episode_sums[name] += contribution
+            diagnostics["teacher_reward_raw/" + name] = raw.detach().clone()
+            diagnostics["teacher_reward_weighted/" + name] = contribution.detach().clone()
+        carry = self.student_carry
+        for name, scale in self.cfg.student.scales.items():
+            raw = (carry.terms[name] if name in carry.terms
+                   else getattr(self, "_reward_" + name)())
+            if raw.shape != self.rew_buf.shape:
+                raise ValueError("Student reward must have shape [num_envs]: " + name)
+            raw = torch.where(student, raw, 0.)
+            contribution = raw * scale * self.dt
+            student_total += contribution
+            if name.startswith("carry_") or name == "zero_command_stillness":
+                task_total += contribution
+            carry.episode_sums[name] += contribution
+            diagnostics["student_reward_raw/" + name] = raw.detach().clone()
+            diagnostics["student_reward_weighted/" + name] = contribution.detach().clone()
+        diagnostics["student_reward_before_clip"] = student_total.detach().clone()
+        if self.cfg.rewards.only_positive_rewards:
+            teacher_total.clamp_min_(0.)
+            student_total.clamp_min_(0.)
+        # Preserve inherited termination-after-positive-clipping semantics.
+        if "termination" in self.reward_scales:
+            raw = torch.where(teacher, self._reward_termination(), 0.)
+            contribution = raw * self.reward_scales["termination"]
+            teacher_total += contribution
+            self.episode_sums["termination"] += contribution
+            diagnostics["teacher_reward_raw/termination"] = raw.detach().clone()
+            diagnostics["teacher_reward_weighted/termination"] = contribution.detach().clone()
+        self.rew_buf[:] = teacher_total + student_total
+        if not torch.isfinite(self.rew_buf).all():
+            raise ValueError("Non-finite phase-owned reward")
+        carry.steps += student
+        carry.total_sum += student_total
+        diagnostics.update(
+            teacher_total_reward=teacher_total.detach().clone(),
+            student_task_reward=task_total.detach().clone(),
+            student_total_reward=student_total.detach().clone(),
+            total_reward=self.rew_buf.detach().clone(),
+            episode_student_steps=carry.steps.detach().clone(),
+            episode_student_mean_reward=(carry.total_sum / carry.steps.clamp_min(1)).detach().clone(),
+        )
+
+    def _post_physics_step_callback(self):
+        super()._post_physics_step_callback()
+        self.extras.pop("episode", None)
 
     def reset_idx(self, env_ids):
+        summary = {}
+        if len(env_ids) and hasattr(self, "student_carry"):
+            carry = self.student_carry
+            steps = carry.steps[env_ids]
+            reached = steps > 0
+            summary = {"student/steps": steps.mean(),
+                       "student/episodes_without_student": (~reached).float().sum(),
+                       "student/episodes_with_student": reached.float().sum()}
+            # Average per-episode, per-Student-step contributions; episodes with
+            # no Student steps are counted separately and excluded from means.
+            denominator = reached.sum().clamp_min(1)
+            for name, sums in {"total": carry.total_sum, **carry.episode_sums}.items():
+                summary["student/mean_step_reward/" + name] = (
+                    sums[env_ids] / steps.clamp_min(1) * reached).sum() / denominator
         super().reset_idx(env_ids)
+        if summary:
+            self.extras["episode"].update(summary)
         if len(env_ids) and hasattr(self, "handoff"):
+            self.student_carry.reset(env_ids)
             self.handoff.reset(env_ids)
             self.teacher_last_action[env_ids] = 0
             self.student_first_action[env_ids] = 0

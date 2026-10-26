@@ -3,6 +3,7 @@ import argparse
 import ast
 import contextlib
 import io
+import importlib.util
 from pathlib import Path
 import sys
 import tempfile
@@ -19,6 +20,20 @@ from legged_gym.mixed_handoff import (
     HandoffSettings, HandoffState, STUDENT_CONTROL, TEACHER_CONTROL,
     load_actor, sample_commands,
 )
+
+# Exercise the repository's real quaternion math without importing the utils
+# package initializer (which imports Isaac Gym and the training runner).
+spec = importlib.util.spec_from_file_location("scope2_torch_utils", ROOT / "legged_gym/legged_gym/utils/torch_utils.py")
+MATH = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(MATH)
+student_path = ROOT / "legged_gym/legged_gym/student_carry.py"
+student_tree = ast.parse(student_path.read_text(encoding="utf-8"))
+student_tree.body = [n for n in student_tree.body if not (
+    isinstance(n, ast.ImportFrom) and n.module == "legged_gym.utils.torch_utils")]
+STUDENT = {name: getattr(MATH, name) for name in
+           ("calc_heading_quat", "quat_conjugate", "quat_mul", "quat_rotate_inverse")}
+exec(compile(student_tree, str(student_path), "exec"), STUDENT)
+StudentCarry, StudentCarryCfg = STUDENT["StudentCarry"], STUDENT["StudentCarryCfg"]
 
 
 def classes_from_source(path, names, namespace):
@@ -39,15 +54,18 @@ def environment_fixture(settings=None):
     directory = ROOT / "legged_gym/legged_gym/envs/g1"
     classes_from_source(directory / "carrybox.py", ["LeggedRobot"], namespace)
     namespace.update(HandoffSettings=HandoffSettings, HandoffState=HandoffState,
-                     STUDENT_CONTROL=STUDENT_CONTROL)
+                     STUDENT_CONTROL=STUDENT_CONTROL, StudentCarry=StudentCarry)
     classes_from_source(directory / "carrybox_mixed_handoff.py", ["MixedHandoff"], namespace)
     env = namespace["MixedHandoff"].__new__(namespace["MixedHandoff"])
     env.num_envs, env.device, env.dt = 2, "cpu", .02
-    env.cfg = NS(rewards=NS(thresh_robot2object=.7, target_speed_loco=.85),
-                 normalization=NS(clip_actions=100.))
+    env.cfg = NS(rewards=NS(thresh_robot2object=.7, target_speed_loco=.85,
+                           max_contact_force=350., only_positive_rewards=False,
+                           soft_dof_vel_limit=.8, soft_torque_limit=.95),
+                 normalization=NS(clip_actions=100.), student=StudentCarryCfg())
     env.handoff = HandoffState(2, "cpu", env.dt, settings or HandoffSettings())
     env.root_states = torch.zeros(2, 13)
     env.root_states[:, 2] = .8
+    env.root_states[:, 6] = 1.
     env.box_states = env.root_states.clone()
     env.box_states[:, 0] = .6
     env.box_states[:, 6] = 1
@@ -85,7 +103,14 @@ def environment_fixture(settings=None):
     env.extras = {}
     env.add_noise = False
     env.base_ang_vel = env.base_lin_vel = torch.zeros(2, 3)
-    env.dof_pos = env.dof_vel = env.default_dof_pos = torch.zeros(2, 29)
+    env.dof_pos = torch.zeros(2, 29)
+    env.dof_vel = torch.zeros(2, 29)
+    env.default_dof_pos = torch.zeros(1, 29)
+    env.dof_names = [line.split()[1] for line in (ROOT / "legged_gym/resources/config/joint_id.txt").read_text().splitlines()]
+    env.feet_air_time = torch.zeros(2, 2)
+    env.first_contacts = torch.zeros(2, 2, dtype=torch.bool)
+    env.student_carry = StudentCarry(env, env.cfg.student, dict(
+        pelvis=0, torso=0, hands=[7, 8], palms=[7, 8], feet=[1, 2], knees=[3, 4]))
     env.end_effector_pos = torch.zeros(2, 15)
     env.obs_scales = NS(ang_vel=.25, dof_pos=1., dof_vel=.05, lin_vel=2.)
     env.obs_buf = torch.arange(738.).repeat(2, 1)
