@@ -1,6 +1,6 @@
 """Configuration for the continuous frozen-Teacher / Student task."""
 
-from .carrybox_config import G1Cfg
+from .carrybox_config import G1Cfg, G1CfgPPO
 
 
 class MixedHandoffCfg(G1Cfg):
@@ -148,3 +148,44 @@ class MixedHandoffCfg(G1Cfg):
         grasp_loss_grace_s = 0.3  # s of complete filtered contact loss
         box_tilt_termination_deg = 70.0
         terminate_box_tilt = False  # Existing successful handoff can exceed 70 degrees.
+
+
+class MixedHandoffTrainingCfg(MixedHandoffCfg):
+    """Conservative training profile; Viewer and original carrybox stay unchanged."""
+    class env(MixedHandoffCfg.env):
+        num_envs = 16
+        episode_length_s = 60
+        test = False
+
+    # Inherit the existing randomization settings; add no new randomization.
+    # reset_mode remains default: every episode starts before Teacher pickup.
+
+
+class MixedHandoffCfgPPO(G1CfgPPO):
+    runner_class_name = "MixedHandoffOnPolicyRunner"
+
+    class algorithm(G1CfgPPO.algorithm):
+        learning_rate = 2e-4  # Carry12 velocity-tracking baseline
+        value_smoothness_coef = .1
+        smoothness_upper_bound = 1.
+        smoothness_lower_bound = .1
+        amp_batch_size = 256
+
+    class runner(G1CfgPPO.runner):
+        algorithm_class_name = "MixedHandoffPPO"
+        num_steps_per_env = 100
+        max_iterations = 20  # collection iterations, including Teacher warmup
+        max_optimizer_updates = 5
+        save_interval = 5
+        experiment_name = "mixed_handoff_student"
+        run_name = "scope3"
+
+    class amp:
+        enabled = True
+        num_obs = 540
+        num_one_step_obs = 54
+        window_length = 10
+        amp_coef = .25
+        reward_scale = .5  # same discriminator reward scale as HIMOnPolicyRunner
+        use_normalizer = False
+        expert_config = "{LEGGED_GYM_ROOT_DIR}/resources/config/carrybox_carrywith_only.yaml"

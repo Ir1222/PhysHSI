@@ -28,4 +28,11 @@
 #
 # Copyright (c) 2021 ETH Zurich, Nikita Rudin
 
-from .him_on_policy_runner import HIMOnPolicyRunner
+__all__ = ["HIMOnPolicyRunner"]
+
+
+def __getattr__(name):
+    if name == "HIMOnPolicyRunner":
+        from .him_on_policy_runner import HIMOnPolicyRunner
+        return HIMOnPolicyRunner
+    raise AttributeError(name)

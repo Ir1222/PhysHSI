@@ -28,4 +28,12 @@
 #
 # Copyright (c) 2021 ETH Zurich, Nikita Rudin
 
-from .him_ppo import HIMPPO
+__all__ = ["HIMPPO"]
+
+
+def __getattr__(name):
+    # The mixed runner does not require the legacy optional Muon optimizer.
+    if name == "HIMPPO":
+        from .him_ppo import HIMPPO
+        return HIMPPO
+    raise AttributeError(name)

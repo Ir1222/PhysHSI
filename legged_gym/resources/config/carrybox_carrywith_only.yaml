@@ -1,0 +1,8 @@
+motions:
+  carryWith:
+    - file: ../dataset/dataset_carrybox/carryWith/carrywith1.pt
+      weight: 5.0
+    - file: ../dataset/dataset_carrybox/carryWith/carrywith2.pt
+      weight: 2.0
+    - file: ../dataset/dataset_carrybox/carryWith/carrywith3.pt
+      weight: 5.0

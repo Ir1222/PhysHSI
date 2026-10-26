@@ -26,7 +26,8 @@ class MotionLib:
         self.process_motions(dof_names)
 
     def load_motions(self, motion_file, mapping_file):
-        lines = open(mapping_file).readlines()
+        with open(mapping_file) as mapping_stream:
+            lines = mapping_stream.readlines()
         lines = [line[:-1].split(" ") for line in lines]
         self.mapping = {k: int(v) for v, k in lines}
 
@@ -59,7 +60,7 @@ class MotionLib:
             self.motion_rsi_skipped_ranges[skill] = []
             for motion_entry in motion_list:
                 curr_file = motion_entry['file']
-                curr_data = torch.load(os.path.join(dir_name, curr_file))
+                curr_data = torch.load(self.resolve_motion_file(dir_name, curr_file))
                 
                 curr_motion_len = list(curr_data.values())[0].shape[0]
                 curr_weight = motion_entry['weight']
@@ -91,6 +92,9 @@ class MotionLib:
         self.motion_end_ids_tot = torch.concat(list(self.motion_end_ids.values()), dim=0)
         self.motion_len_tot = torch.concat(list(self.motion_len.values()), dim=0)
 
+    def resolve_motion_file(self, directory, filename):
+        return os.path.join(directory, filename)
+
     def process_motions(self, dof_names):
         self.tot_frames = sum(self.tot_len.values())
 
@@ -113,7 +117,7 @@ class MotionLib:
         self.motion_has_box_quat = torch.zeros(self.tot_frames, dtype=torch.bool, device=self.device)
         self.motion_end_effector_pos = torch.zeros(self.tot_frames, len(self.end_effector_name), 3, dtype=torch.float, device=self.device)
         self.motion_base_z_bias = torch.zeros(self.tot_frames, 1, dtype=torch.float, device=self.device)
-        self.contact_index = torch.zeros(self.num_motion['pickUp'], dtype=torch.long, device=self.device)
+        self.contact_index = torch.zeros(self.num_motion.get('pickUp', 0), dtype=torch.long, device=self.device)
 
         for skill in self.skills:
             for i, traj in enumerate(self.motion_data[skill]):
