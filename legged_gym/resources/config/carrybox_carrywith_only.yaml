@@ -1,3 +1,5 @@
+# Paths are relative to this YAML in resources/config, on both Windows and Ubuntu.
+# The original CarryWith clips are tracked in resources/dataset/dataset_carrybox/carryWith.
 motions:
   carryWith:
     - file: ../dataset/dataset_carrybox/carryWith/carrywith1.pt

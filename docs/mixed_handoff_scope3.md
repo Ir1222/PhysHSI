@@ -2,6 +2,8 @@
 
 Implemented against `9db724080e0bdb9044c05bbbeaa353fea9be2d03` on
 `codex/minimal-carrybox-loco-pickup`. Validation date: 2026-10-26.
+Dataset integration update: 2026-10-27. The three original CarryWith binaries
+are now tracked at the default YAML paths and verified without a motion-root override.
 No production training was launched. Isaac Gym is unavailable on this Windows
 machine; physical smoke tests below remain to be run on Ubuntu.
 
@@ -141,18 +143,23 @@ adjacent expert history frames are 1.2 source frames apart, covering 0.18 s.
 Interpolation is confined to each clip, including its final-frame clamp.
 No temporal jitter, alternate skill or artificial RSI state is substituted.
 
-The binaries are **absent from this branch's default dataset directory**. They
-were found and CPU-audited in:
+The three original binaries are now included in this branch at:
 
 ```text
-D:\AAAProject\0806\PhysHSI\legged_gym\resources\dataset\dataset_carrybox\carryWith
+legged_gym/resources/dataset/dataset_carrybox/carryWith/carrywith1.pt
+legged_gym/resources/dataset/dataset_carrybox/carryWith/carrywith2.pt
+legged_gym/resources/dataset/dataset_carrybox/carryWith/carrywith3.pt
 ```
 
 The local `velocity-tracking` branch's YAML and PPO configuration were read
-without checking out or merging that branch. For runtime, copy the original
-files into `legged_gym/resources/dataset/dataset_carrybox/carryWith/` or use
-`--amp_motion_root`. Missing files fail before PhysX allocation with all resolved
-paths. Teacher continues to use its original `carrybox_loco_pickup.yaml`.
+without checking out or merging that branch. The migrated files match the
+previously audited SHA256 identities below. The YAML's `../dataset/...` paths
+already resolve relative to `legged_gym/resources/config/`, so the default
+training config works from either checkout with no absolute Windows paths or
+`--amp_motion_root`. Directory case is exactly `carryWith`, including on Ubuntu.
+`--amp_motion_root` remains an optional override. Missing files still fail before
+PhysX allocation with resolved paths. Teacher continues to use its original
+`carrybox_loco_pickup.yaml` and synthesized Hold clips.
 
 ## AMP validity and rewards
 
@@ -209,16 +216,18 @@ starts a normal Teacher pickup episode with cleared AMP validity.
 
 ```bash
 python -m unittest discover -s tests -v
-python tests/audit_carrywith_amp.py --motion_root /path/to/original/carryWith
+python tests/audit_carrywith_amp.py
 ```
 
-All **65 tests passed** (42 previous Scope 1/2 tests plus 23 new tests). They
+All **66 tests passed** (42 previous Scope 1/2 tests plus 24 training/dataset tests). They
 exercise real ActorCritic, AMP, Adam and MotionLib on CPU; simulator-dependent
 imports are adapted only for the tensor fixtures. Cases include async ownership,
 poisoned Teacher placeholders, empty rollouts, hand-calculated GAE, pure timeout
 and simultaneous failure, valid-only normalization, smoothness boundaries,
 history warmup/reset, expert probabilities/clip boundaries, missing files,
-normalizer isolation, CLI, resume and the existing Viewer Actor loader.
+normalizer isolation, CLI, resume and the existing Viewer Actor loader. The
+dataset integration test loads the tracked 256/194/323-frame clips using the
+default YAML and verifies finite 540D output without an external data override.
 
 A seeded synthetic valid batch (5 Student rows, 5 AMP rows, two Adam minibatches,
 LR `2e-4`) produced these maximum absolute parameter changes:
@@ -251,16 +260,19 @@ carrywith3.pt 1f0868733cee5eafeb85f72fd2975c521f8d6d085f7961541c1f55f505c55d29
 ## Ubuntu short smoke commands (not executed here)
 
 Run inside the existing working Isaac Gym environment with this branch installed.
-Set `EXPERT` to the directory containing the original three files. All commands
-are bounded; even zero-Student collection terminates at `--max_iterations` and
-reports `updated=0` instead of claiming learning.
+Pull the branch to obtain the three tracked files, then audit the default data
+before starting PhysX. All commands are bounded; even zero-Student collection
+terminates at `--max_iterations` and reports `updated=0` instead of claiming learning.
 
 ```bash
 cd /home/han/pyx/PhysHSI-carrybox
+git switch codex/minimal-carrybox-loco-pickup
+git pull --ff-only origin codex/minimal-carrybox-loco-pickup
 export PYTHONPATH="$PWD/legged_gym:$PWD/rsl_rl:${PYTHONPATH:-}"
 TEACHER="$PWD/legged_gym/logs/minimal_carrybox/Oct25_19-58-13_loco_pickup_hold_resume/model_17000.pt"
-EXPERT="$PWD/legged_gym/resources/dataset/dataset_carrybox/carryWith"
 RUN="$PWD/legged_gym/logs/mixed_handoff_student/scope3_smoke_c"
+test -f "$TEACHER"
+python tests/audit_carrywith_amp.py
 
 # A: Frozen Teacher / real handoff collection, no optimization, no expert needed.
 python legged_gym/legged_gym/scripts/train_mixed_handoff.py \
@@ -280,8 +292,7 @@ python legged_gym/legged_gym/scripts/train_mixed_handoff.py \
 # C / fresh training: Student PPO + masked CarryWith AMP, at most three updates.
 python legged_gym/legged_gym/scripts/train_mixed_handoff.py \
   --teacher_checkpoint "$TEACHER" --student_init_checkpoint "$TEACHER" \
-  --amp_expert_config legged_gym/resources/config/carrybox_carrywith_only.yaml \
-  --amp_motion_root "$EXPERT" --allow_legacy_contract \
+  --allow_legacy_contract \
   --num_envs 4 --steps_per_env 100 --max_iterations 30 \
   --max_optimizer_updates 3 --headless --seed 1 --rl_device cuda:0 \
   --log_dir "$RUN"
@@ -290,7 +301,7 @@ python legged_gym/legged_gym/scripts/train_mixed_handoff.py \
 STUDENT=$(python -c 'import pathlib,sys; print(max(pathlib.Path(sys.argv[1]).glob("model_*.pt"), key=lambda p:int(p.stem.split("_")[-1])))' "$RUN")
 python legged_gym/legged_gym/scripts/train_mixed_handoff.py \
   --teacher_checkpoint "$TEACHER" --allow_legacy_contract \
-  --amp_motion_root "$EXPERT" --num_envs 4 --steps_per_env 100 \
+  --num_envs 4 --steps_per_env 100 \
   --max_iterations 30 --max_optimizer_updates 1 --headless --seed 1 \
   --rl_device cuda:0 --resume --resume_path "$STUDENT" \
   --log_dir "${RUN}_resume"
@@ -314,7 +325,7 @@ contact ratio, slip, relative box motion, tilt and termination breakdown.
 
 The Linux Teacher checkpoint and real PhysX rollout have not been executed here.
 Run A/B/C, resume and Viewer checks before increasing scale. The default expert
-paths need the original binaries or `--amp_motion_root`. Short controlled updates
+paths now contain the tracked binaries after pulling this branch. Short controlled updates
 validate infrastructure; they do not establish stable carrying performance.
 
 Scope 2's known hand-face convention mismatch, box-tilt and arm-posture penalties

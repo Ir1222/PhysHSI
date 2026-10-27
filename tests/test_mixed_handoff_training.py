@@ -452,6 +452,19 @@ class ExpertTests(unittest.TestCase):
         torch.testing.assert_close(obs[0, :, 45:48], torch.tensor([.2, 0., .1]).repeat(10, 1))
         self.assertEqual(obs.flatten(1).shape, (12000, 540))
 
+    def test_tracked_carrywith_dataset_loads_from_default_yaml_without_override(self):
+        config = ROOT / "legged_gym/resources/config/carrybox_carrywith_only.yaml"
+        _, _, files = validate_carrywith_config(config)
+        expected = ROOT / "legged_gym/resources/dataset/dataset_carrybox/carryWith"
+        self.assertEqual(files, [(expected / f"carrywith{i}.pt").resolve() for i in (1, 2, 3)])
+        with contextlib.redirect_stdout(io.StringIO()):
+            sampler = CarryWithMotionLib(config, str(self.mapping), self.names, 60, "cpu", .02, .7)
+        self.assertEqual(sampler.motion_len_tot.tolist(), [256, 194, 323])
+        self.assertEqual(sampler.motion_weights_tot.tolist(), [5., 2., 5.])
+        obs = sampler.get_expert_obs(32)
+        self.assertEqual(obs.shape, (32, 540))
+        self.assertTrue(torch.isfinite(obs).all())
+
     def test_expert_uses_same_projection_and_motionlib_preprocessing(self):
         sampler = self.sampler()
         raw = torch.cat([sampler.motion_base_height, sampler.motion_dof_pos, sampler.motion_end_effector_pos,

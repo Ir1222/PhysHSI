@@ -1,6 +1,7 @@
 """Optional CPU audit of real legacy CarryWith clips against the current URDF.
 
-Run from the repository root with --motion_root DIR. No Isaac Gym is imported.
+Run from the repository root to audit the tracked CarryWith dataset. An optional
+--motion_root DIR selects another copy. No Isaac Gym is imported.
 The unit-test import adapter loads the real MotionLib with the real quaternion
 utilities while bypassing the simulator-dependent environment package initializer.
 """
@@ -16,7 +17,7 @@ import torch
 from test_mixed_handoff_training import CarryWithMotionLib, ROOT
 
 
-def audit(motion_root, samples=12000):
+def audit(motion_root=None, samples=12000):
     torch.set_num_threads(1)
     torch.manual_seed(17)
     mapping = ROOT / "legged_gym/resources/config/joint_id.txt"
@@ -72,7 +73,7 @@ def audit(motion_root, samples=12000):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--motion_root", required=True)
+    parser.add_argument("--motion_root", help="Override the tracked dataset; defaults to paths in carrybox_carrywith_only.yaml")
     parser.add_argument("--samples", type=int, default=12000)
     args = parser.parse_args()
     print(json.dumps(audit(args.motion_root, args.samples), indent=2))
