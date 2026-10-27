@@ -234,15 +234,6 @@ class HandoffTests(unittest.TestCase):
         for before, after in zip(before_physics, (env.root_states, env.dof_pos, env.box_states)):
             torch.testing.assert_close(before, after)
 
-    def test_joint_mapping_is_validated_before_checkpoint_loading(self):
-        path = ROOT / "legged_gym/legged_gym/scripts/play_mixed_handoff.py"
-        tree = ast.parse(path.read_text(encoding="utf-8"))
-        function = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "actor_contract")
-        namespace = {"Path": Path, "LEGGED_GYM_ROOT_DIR": str(ROOT / "legged_gym")}
-        exec(compile(ast.Module(body=[function], type_ignores=[]), str(path), "exec"), namespace)
-        with self.assertRaisesRegex(ValueError, "joint ordering"):
-            namespace["actor_contract"](NS(dof_names=["wrong"] * 29))
-
     def test_command_ownership_and_teacher_semantics(self):
         env = environment_fixture()
         env.root_states[0, 0] = -2.  # Teacher is still approaching.
@@ -322,10 +313,9 @@ class CliTests(unittest.TestCase):
 
     def test_reported_stand_command(self):
         args = self.parse(["--teacher_checkpoint", "teacher.pt", "--student_checkpoint", "teacher.pt",
-                           "--allow_legacy_contract", "--mode", "stand", "--num_envs", "1",
+                           "--mode", "stand", "--num_envs", "1",
                            "--steps", "3000", "--csv", "logs/handoff_stand.csv"])
         self.assertEqual(args.mode, "stand")
-        self.assertTrue(args.allow_legacy_contract)
         self.assertEqual(args.student_checkpoint, "teacher.pt")
         self.assertEqual(args.csv, "logs/handoff_stand.csv")
 
@@ -350,17 +340,16 @@ class CheckpointTests(unittest.TestCase):
     def setUp(self):
         self.folder = tempfile.TemporaryDirectory()
         self.path = str(Path(self.folder.name) / "actor.pt")
-        self.contract = {"dof_names": [f"joint_{i}" for i in range(29)], "activation": "elu"}
-        actor = nn.Sequential(nn.Linear(738, 8), nn.ELU(), nn.Linear(8, 29))
-        self.checkpoint = {"model_state_dict": {"actor." + k: v for k, v in actor.state_dict().items()},
-                           "scope1_contract": self.contract}
+        actor = nn.Sequential(nn.Linear(738, 512), nn.ELU(), nn.Linear(512, 256),
+                              nn.ELU(), nn.Linear(256, 256), nn.ELU(), nn.Linear(256, 29))
+        self.checkpoint = {"model_state_dict": {"actor." + k: v for k, v in actor.state_dict().items()}}
 
     def tearDown(self):
         self.folder.cleanup()
 
     def load(self, **kwargs):
         torch.save(self.checkpoint, self.path)
-        return load_actor(self.path, self.contract, **kwargs)
+        return load_actor(self.path, **kwargs)
 
     def test_actor_only_frozen_eval_and_actual_layer_dimensions(self):
         self.checkpoint["model_state_dict"]["critic.0.weight"] = torch.ones(2, 126)
@@ -369,15 +358,14 @@ class CheckpointTests(unittest.TestCase):
             actor, spec = self.load()
             self.assertFalse(actor.training)
             self.assertTrue(all(not p.requires_grad for p in actor.parameters()))
-            self.assertEqual(spec["dims"], [738, 8, 29])
+            self.assertEqual(spec["dims"], [738, 512, 256, 256, 29])
             with torch.no_grad():
                 self.assertEqual(tuple(actor(torch.zeros(2, 738)).shape), (2, 29))
 
-    def test_reject_dimensions_parameter_names_and_joint_order(self):
+    def test_reject_dimensions_and_parameter_names(self):
         for mutation, message in (
-            (lambda c: c["model_state_dict"].update({"actor.0.weight": torch.zeros(8, 737)}), "dimensions"),
+            (lambda c: c["model_state_dict"].update({"actor.0.weight": torch.zeros(512, 737)}), "dimensions"),
             (lambda c: c["model_state_dict"].pop("actor.2.bias"), "parameter names/shapes"),
-            (lambda c: c.update(scope1_contract={**self.contract, "dof_names": list(reversed(self.contract["dof_names"]))}), "dof_names"),
         ):
             original = {**self.checkpoint, "model_state_dict": dict(self.checkpoint["model_state_dict"])}
             mutation(self.checkpoint)
@@ -385,19 +373,19 @@ class CheckpointTests(unittest.TestCase):
                 self.load()
             self.checkpoint = original
 
-    def test_missing_metadata_requires_explicit_assumption(self):
-        self.checkpoint.pop("scope1_contract")
-        with self.assertRaisesRegex(ValueError, "missing scope1_contract"):
-            self.load()
-        with self.assertWarns(UserWarning):
-            _, spec = self.load(allow_legacy_contract=True)
-        self.assertEqual(spec["semantics"], "source_assumption")
+    def test_native_checkpoint_and_old_optional_metadata_both_load(self):
+        self.assertNotIn("scope1_contract", self.checkpoint)
+        native, _ = self.load()
+        self.checkpoint["scope1_contract"] = {"old": "optional metadata"}
+        old, _ = self.load()
+        for a, b in zip(native.parameters(), old.parameters()):
+            torch.testing.assert_close(a, b, atol=0, rtol=0)
 
     def test_output_contract_nonfinite_weights_and_adapter_rejected(self):
-        self.checkpoint["model_state_dict"]["actor.2.weight"] = torch.zeros(28, 8)
+        self.checkpoint["model_state_dict"]["actor.6.weight"] = torch.zeros(28, 256)
         with self.assertRaisesRegex(ValueError, "output=29"):
             self.load()
-        self.checkpoint["model_state_dict"]["actor.2.weight"] = torch.full((29, 8), float("nan"))
+        self.checkpoint["model_state_dict"]["actor.6.weight"] = torch.full((29, 256), float("nan"))
         with self.assertRaisesRegex(ValueError, "non-finite"):
             self.load()
         self.checkpoint["handoff_contract"] = {}

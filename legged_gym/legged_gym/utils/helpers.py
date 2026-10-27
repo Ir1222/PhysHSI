@@ -165,6 +165,8 @@ def update_cfg_from_args(env_cfg, cfg_train, args):
             env_cfg.play_dataset = False
         if env_cfg.play_dataset:
             env_cfg.env.num_envs = 1
+        if getattr(args, "detailed_handoff_events", False) and hasattr(env_cfg, "diagnostics"):
+            env_cfg.diagnostics.detailed = True
     if cfg_train is not None:
         if args.seed is not None:
             cfg_train.seed = args.seed
@@ -206,7 +208,7 @@ def get_args():
         {"name": "--play_dataset", "action": "store_true", "default": False, "help": "Visualize the reference."},
         {"name": "--teacher_checkpoint", "type": str, "help": "Mixed handoff frozen Teacher override"},
         {"name": "--student_init_checkpoint", "type": str, "help": "Mixed handoff fresh Actor/std override"},
-        {"name": "--allow_legacy_contract", "action": "store_true", "help": "Explicit source-audited legacy Actor opt-in"},
+        {"name": "--detailed_handoff_events", "action": "store_true", "help": "Opt in to detailed mixed handoff diagnostics and event export"},
         {"name": "--collect_only", "action": "store_true", "help": "Mixed handoff collection without optimization"},
         {"name": "--no_amp", "action": "store_true", "help": "Mixed handoff PPO-only diagnostic"},
         {"name": "--steps_per_env", "type": int, "help": "Mixed handoff rollout length override"},

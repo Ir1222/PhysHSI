@@ -11,7 +11,7 @@ from unittest.mock import patch
 import torch
 
 from test_mixed_handoff_training import (
-    MixedHandoffOnPolicyRunner, TensorEnvironment, actor_critic, configuration, CONTRACT,
+    MixedHandoffOnPolicyRunner, TensorEnvironment, actor_critic, configuration,
 )
 
 
@@ -27,19 +27,20 @@ class TerminalLoggerTests(unittest.TestCase):
         self.output = io.StringIO()
         self.capture = contextlib.redirect_stdout(self.output)
         self.capture.__enter__()
-        torch.save(dict(model_state_dict=actor_critic().state_dict(), scope1_contract=CONTRACT), self.teacher)
+        torch.save(dict(model_state_dict=actor_critic().state_dict()), self.teacher)
 
     def tearDown(self):
         self.capture.__exit__(None, None, None)
         self.folder.cleanup()
 
-    def runner(self, interval=None, save_interval=500, steps=1, log=True):
+    def runner(self, interval=None, save_interval=500, steps=1, log=True, detailed=False):
         cfg = configuration(amp=False, steps=steps)
         cfg["runner"]["save_interval"] = save_interval
+        cfg["runner"]["detailed_handoff_events"] = detailed
         if interval is not None:
             cfg["runner"]["terminal_log_interval"] = interval
         with patch("torch.utils.tensorboard.SummaryWriter"):
-            runner = MixedHandoffOnPolicyRunner(TensorEnvironment(), cfg, self.teacher, CONTRACT,
+            runner = MixedHandoffOnPolicyRunner(TensorEnvironment(), cfg, self.teacher,
                                                 log_dir=self.root / "logs" if log else None)
         self.output.seek(0)
         self.output.truncate(0)
@@ -109,10 +110,77 @@ class TerminalLoggerTests(unittest.TestCase):
         scalars = runner.writer.add_scalar.call_args_list
         self.assertEqual([c.args[2] for c in scalars if c.args[0] == "collection_iterations"], list(range(1, 8)))
         self.assertTrue(any(c.args[0] == "performance/student_reward_weighted/carry_box_tilt" for c in scalars))
-        self.assertTrue(any(c.args[2] == 2 for c in runner.writer.add_histogram.call_args_list))
-        self.assertTrue((self.root / "logs/handoff_events.jsonl").read_text().strip())
+        runner.writer.add_histogram.assert_not_called()
+        self.assertFalse((self.root / "logs/handoff_events.jsonl").exists())
         self.assertEqual(runner.writer.flush.call_count, 7)
         runner.writer.close.assert_called_once()
+
+    def test_episode_rollout_cumulative_ratios_and_real_tensorboard_json(self):
+        from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+        cfg = configuration(amp=False, steps=10)
+        directory = self.root / "metrics"
+        runner = MixedHandoffOnPolicyRunner(TensorEnvironment(), cfg, self.teacher, log_dir=directory)
+        runner.learn(2, max_optimizer_updates=None)
+        rows = [json.loads(line) for line in (directory / "training_metrics.jsonl").read_text().splitlines()]
+        first, second = rows
+        self.assertAlmostEqual(first["student_valid_ratio"], 14 / 20)
+        self.assertAlmostEqual(first["student_step_fraction"], 14 / 20)
+        self.assertEqual(first["episode_student_fraction_count"], 0)
+        self.assertEqual(first["student/completed_survival_s/count"], 0)
+        self.assertEqual(first["student/censored_timeout_s/count"], 0)
+        self.assertEqual(first["student/segment_duration_s/count"], 0)
+        self.assertAlmostEqual(second["student_valid_ratio"], 16 / 20)
+        self.assertAlmostEqual(second["student_step_fraction"], 30 / 40)
+        self.assertAlmostEqual(second["episode_student_fraction"], (14 / 16 + 14 / 18) / 2)
+        self.assertEqual(second["episode_student_fraction_count"], 2)
+        self.assertAlmostEqual(second["amp_valid_fraction"], 10 / 16)
+        self.assertAlmostEqual(second["cumulative_amp_valid_fraction"], 10 / 30)
+        for key, count in (("student/segment_duration_s", 2),
+                           ("student/completed_survival_s", 1), ("student/censored_timeout_s", 1)):
+            self.assertAlmostEqual(second[key], .28)
+            self.assertEqual(second[key + "/count"], count)
+            self.assertAlmostEqual(second["distribution/" + key + "/median"], .28)
+            self.assertAlmostEqual(second["distribution/" + key + "/p90"], .28)
+        events = EventAccumulator(str(directory)).Reload()
+        for key in ("student_valid_ratio", "student_step_fraction", "episode_student_fraction",
+                    "episode_student_fraction_count", "amp_valid_fraction", "cumulative_amp_valid_fraction",
+                    "student/segment_duration_s", "student/completed_survival_s", "student/censored_timeout_s",
+                    "kl", "learning_rate"):
+            scalars = events.Scalars(key)
+            self.assertEqual(scalars[-1].step, 2)
+            self.assertAlmostEqual(scalars[-1].value, second[key], places=6)
+        # Resumed cumulative counters continue, while physical episodes restart.
+        resumed = MixedHandoffOnPolicyRunner(TensorEnvironment(), cfg, self.teacher, initialize=False)
+        resumed.load(directory / "model_2.pt")
+        with patch.object(resumed, "log") as log:
+            resumed.learn(1, optimize=False)
+        self.assertEqual(resumed.teacher_steps + resumed.student_steps, 60)
+        self.assertEqual(resumed.student_steps, 44)
+        self.assertAlmostEqual(log.call_args.args[0]["student_step_fraction"], 44 / 60)
+        self.assertEqual(log.call_args.args[0]["episode_student_fraction_count"], 0)
+
+    def test_completed_teacher_only_episodes_contribute_zero_fraction(self):
+        class TeacherOnlySecond(TensorEnvironment):
+            def step(self, actions):
+                result = super().step(actions)
+                self.handoff.phase[1] = 0
+                result[4]["handoff"]["handoff_trigger"][1] = False
+                return result
+
+        runner = MixedHandoffOnPolicyRunner(TeacherOnlySecond(), configuration(False, 10), self.teacher)
+        with patch.object(runner, "log") as log:
+            runner.learn(2, optimize=False)
+        metrics = log.call_args.args[0]
+        self.assertEqual(metrics["episode_student_fraction_count"], 2)
+        self.assertAlmostEqual(metrics["episode_student_fraction"], (14 / 16 + 0) / 2)
+        self.assertAlmostEqual(metrics["performance/episode/zero_student_fraction"], .5)
+        self.assertEqual(metrics["student/segment_duration_s/count"], 1)
+
+    def test_debug_events_and_histograms_are_explicitly_enabled(self):
+        runner = self.runner(steps=18, detailed=True)
+        runner.learn(1, optimize=False)
+        self.assertTrue((self.root / "logs/handoff_events.jsonl").read_text().strip())
+        self.assertTrue(runner.writer.add_histogram.called)
 
     def test_exact_interval_completion_prints_one_final_panel(self):
         runner = self.runner(interval=2, log=False)

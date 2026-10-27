@@ -87,29 +87,19 @@ are below 0.1 (up to four attempts, matching the reference).
 
 ## Checkpoint compatibility
 
-Supply explicit trusted training checkpoints; there is no automatic checkpoint
-selection or random-policy fallback. The loader reads only `actor.*` weights
-from `model_state_dict`, checks Sequential parameter names and connected layer
-dimensions, requires 738 inputs/29 outputs, rejects non-finite/missing weights,
-and reconstructs the actual hidden dimensions. The expected source default is
-`[512,256,256]` with ELU, but that hidden shape is not assumed by the loader.
-Old `handoff_contract` action-adapter checkpoints are rejected explicitly.
+Supply trusted native PhysHSI checkpoints directly. The loader reads only
+`checkpoint['model_state_dict']` Actor weights, requires the exact
+`738 -> 512 -> 256 -> 256 -> 29` ELU network, validates state_dict keys/shapes
+and finite weights, then returns a frozen eval-mode Actor. It does not load
+the Critic, optimizer or AMP discriminator for inference. Old action-adapter
+checkpoints remain unsupported. Optional `scope1_contract` metadata is ignored
+by Actor loading; no metadata injection or compatibility flag is needed.
 
-Simulator joint order must equal the existing `resources/config/joint_id.txt`.
-New checkpoint dictionaries can contain `scope1_contract`, exactly matching the
-contract printed by the viewer (joint names, feature order/scales, history,
-activation, control/PD, timestep, default pose and clipping). A mismatch fails.
-Neither current Teacher nor Student training checkpoint was available here.
-
-Old checkpoints usually lack semantic metadata. Tensor shapes alone cannot
-prove joint ordering, feature ordering, activation or normalization. The default
-is to reject them. After auditing their training source, explicitly pass
-`--allow_legacy_contract`; this warns and logs `source_assumption` for missing
-metadata while retaining all weight/dimension checks. This acknowledges the
-audited PhysHSI pickup-stand / velocity-tracking source convention (unnormalized
-ELU MLP, same G1 joint order, features, action scale .25 and control dt .02).
-It does not certify an arbitrary checkpoint. Existing saved metadata is always
-checked even when this flag is present. Neither checkpoint is modified.
+Simulator joint order is checked against `resources/config/joint_id.txt` during
+environment initialization. Full Student resume separately checks network,
+PPO/AMP configuration, runtime timestep/joints, environment settings,
+Teacher hash and CarryWith expert identity. See the current baseline instructions
+in [mixed_handoff_minimal_refactor.md](mixed_handoff_minimal_refactor.md).
 
 ## Ubuntu viewer commands
 
@@ -122,7 +112,7 @@ TEACHER=/home/han/pyx/PhysHSI-carrybox/legged_gym/logs/minimal_carrybox/Oct25_19
 STUDENT=/absolute/path/to/mixed_velocity/model_19999.pt
 PLAYER=(python legged_gym/legged_gym/scripts/play_mixed_handoff.py
   --teacher_checkpoint "$TEACHER" --student_checkpoint "$STUDENT"
-  --allow_legacy_contract --num_envs 1 --seed 1 --steps 3000
+  --num_envs 1 --seed 1 --steps 3000
   --episode_length_s 60 --rl_device cuda:0)
 
 # A: Student standing carry throughout.

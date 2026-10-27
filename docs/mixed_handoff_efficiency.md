@@ -6,7 +6,7 @@ Implementation baseline: `6b3f1cb`, branch `codex/minimal-carrybox-loco-pickup`.
 
 | Setting | Training candidate D | Standard Viewer |
 |---|---|---|
-| Environments | 16 | 1 |
+| Environments | 4096 | 1 |
 | Reset | Native reference reset, PickUp only | Native full Approach |
 | Maximum episode | 20 seconds | 60 seconds |
 | RSI window | contact_index ± 0.2 seconds, clipped per clip | Disabled |
@@ -48,11 +48,11 @@ Native episode_length_buf includes the one initialization refresh step. Handoff 
 
 ## Diagnostics and interpretation
 
-Each iteration records full metrics in `training_metrics.jsonl` and TensorBoard. The terminal uses a compact PhysHSI training panel every 100 collection iterations and at completion. `handoff_events.jsonl` preserves complete per-environment vectors at gates, first Student actions and terminations. It records box height/clearance, both contacts/forces/distances, full base and box linear/angular velocities, tilt, last Teacher action, first actual Student action and its discontinuity. First-action/discontinuity placeholders are omitted before an actual Student action exists. Gate-specific averages use gate rows; discontinuity statistics use first-Student rows.
+Each iteration records full metrics in `training_metrics.jsonl` and TensorBoard. The terminal uses a compact PhysHSI training panel every 100 collection iterations and at completion. With explicit `--detailed_handoff_events`, `handoff_events.jsonl` preserves complete per-environment vectors at gates, first Student actions and terminations. It records box height/clearance, both contacts/forces/distances, full base and box linear/angular velocities, tilt, last Teacher action, first actual Student action and its discontinuity. First-action/discontinuity placeholders are omitted before an actual Student action exists. Gate-specific averages use gate rows; discontinuity statistics use first-Student rows.
 
 Metrics include cumulative Teacher/Student/AMP step counts, rollout Student-valid and AMP-valid counts/fractions, actual PPO updates/optimizer steps, completed-episode Teacher steps/warm-up, success/failure rates, zero-Student episode fraction, segment lengths, fraction below ten frames, and fraction of Student segments reaching AMP validity. Handoff success/failure rates use observed gates and pre-gate episode endings; unfinished Teacher episodes are counted separately.
 
-Handoff times, warm-up and Student segment/survival lengths have min/p10/median/p90/max statistics and TensorBoard histograms. `student/completed_survival_s` describes observed physical failure endpoints; `student/censored_timeout_s` is reported separately. Active Student segments are identified as incomplete, with their count and current mean frame count, and are excluded from completed survival statistics. A missing completed-survival metric means no observed failures in that iteration, not zero survival. These summaries are per collection iteration; they are not a censoring-corrected lifetime estimator.
+Handoff times, warm-up and Student segment/survival lengths have min/p10/median/p90/max statistics and, in explicit debug mode, TensorBoard histograms. `student/completed_survival_s` describes observed physical failure endpoints; `student/censored_timeout_s` is reported separately. Active Student segments are identified as incomplete, with their count and current mean frame count, and are excluded from completed survival statistics. A missing completed-survival metric means no observed failures in that iteration, not zero survival. These summaries are per collection iteration; they are not a censoring-corrected lifetime estimator.
 
 Termination bit flags preserve simultaneous causes: 1 box drop, 2 separation, 4 grasp loss, 8 enabled tilt, 16 inherited physical failure, 32 timeout. Teacher physical failures and episode timeouts are also reported separately. Keep the same checkpoint, seed and physical configuration for A/B/C/D comparisons. Prefer useful samples and feasible optimizer updates with meaningful survival over gate frequency alone.
 
@@ -73,22 +73,22 @@ python -m unittest discover -s ../tests -p 'test_*.py' -v
 PickUp RSI state inspection, with Viewer and printed clip/time/root/joints/box/platform/phase data; this also checks the frozen Teacher's physical continuation. Two collection iterations, no optimization:
 
 ```bash
-python legged_gym/scripts/train_mixed_handoff.py --teacher_checkpoint logs/minimal_carrybox/Oct25_19-58-13_loco_pickup_hold_resume/model_17000.pt --allow_legacy_contract --num_envs 1 --seed 1 --ablation D --inspect_pickup_rsi --collect_only --no_amp --max_iterations 2 --log_dir logs/efficiency_inspect
+python legged_gym/scripts/train_mixed_handoff.py --teacher_checkpoint logs/minimal_carrybox/Oct25_19-58-13_loco_pickup_hold_resume/model_17000.pt --num_envs 1 --seed 1 --ablation D --inspect_pickup_rsi --collect_only --no_amp --max_iterations 2 --log_dir logs/efficiency_inspect
 ```
 
 Frozen Teacher/handoff bounded collection, four environments and twenty iterations:
 
 ```bash
-python legged_gym/scripts/train_mixed_handoff.py --teacher_checkpoint logs/minimal_carrybox/Oct25_19-58-13_loco_pickup_hold_resume/model_17000.pt --allow_legacy_contract --num_envs 4 --seed 1 --ablation D --collect_only --no_amp --headless --max_iterations 20 --log_dir logs/efficiency_collect
+python legged_gym/scripts/train_mixed_handoff.py --teacher_checkpoint logs/minimal_carrybox/Oct25_19-58-13_loco_pickup_hold_resume/model_17000.pt --num_envs 4 --seed 1 --ablation D --collect_only --no_amp --headless --max_iterations 20 --log_dir logs/efficiency_collect
 ```
 
 Controlled collection-only ablations, including 540D AMP validity/reward collection but no optimization:
 
 ```bash
-python legged_gym/scripts/train_mixed_handoff.py --teacher_checkpoint logs/minimal_carrybox/Oct25_19-58-13_loco_pickup_hold_resume/model_17000.pt --allow_legacy_contract --seed 1 --ablation A --collect_only --headless --max_iterations 20 --log_dir logs/efficiency_A
-python legged_gym/scripts/train_mixed_handoff.py --teacher_checkpoint logs/minimal_carrybox/Oct25_19-58-13_loco_pickup_hold_resume/model_17000.pt --allow_legacy_contract --seed 1 --ablation B --collect_only --headless --max_iterations 20 --log_dir logs/efficiency_B
-python legged_gym/scripts/train_mixed_handoff.py --teacher_checkpoint logs/minimal_carrybox/Oct25_19-58-13_loco_pickup_hold_resume/model_17000.pt --allow_legacy_contract --seed 1 --ablation C --collect_only --headless --max_iterations 20 --log_dir logs/efficiency_C
-python legged_gym/scripts/train_mixed_handoff.py --teacher_checkpoint logs/minimal_carrybox/Oct25_19-58-13_loco_pickup_hold_resume/model_17000.pt --allow_legacy_contract --seed 1 --ablation D --collect_only --headless --max_iterations 20 --log_dir logs/efficiency_D
+python legged_gym/scripts/train_mixed_handoff.py --teacher_checkpoint logs/minimal_carrybox/Oct25_19-58-13_loco_pickup_hold_resume/model_17000.pt --num_envs 16 --seed 1 --ablation A --collect_only --headless --max_iterations 20 --log_dir logs/efficiency_A
+python legged_gym/scripts/train_mixed_handoff.py --teacher_checkpoint logs/minimal_carrybox/Oct25_19-58-13_loco_pickup_hold_resume/model_17000.pt --num_envs 16 --seed 1 --ablation B --collect_only --headless --max_iterations 20 --log_dir logs/efficiency_B
+python legged_gym/scripts/train_mixed_handoff.py --teacher_checkpoint logs/minimal_carrybox/Oct25_19-58-13_loco_pickup_hold_resume/model_17000.pt --num_envs 16 --seed 1 --ablation C --collect_only --headless --max_iterations 20 --log_dir logs/efficiency_C
+python legged_gym/scripts/train_mixed_handoff.py --teacher_checkpoint logs/minimal_carrybox/Oct25_19-58-13_loco_pickup_hold_resume/model_17000.pt --num_envs 16 --seed 1 --ablation D --collect_only --headless --max_iterations 20 --log_dir logs/efficiency_D
 ```
 
 A = full Approach/20s/0.3s gate/0.5s Stand; B = PickUp RSI/20s/0.3s/0.5s; C = PickUp RSI/20s/0.3s/0s; D = PickUp RSI/20s/0.1s/0s. `--ablation historical` retains the original full Approach/60s/0.3s/0.5s reference, whose raw fractions should not be treated as a controlled 20s comparison. Explicit CLI flags override the selected profile. `--no_pickup_rsi` selects full Approach; `--reset_mode default` also disables the training RSI extension. `--reset_mode random` and `hybrid` retain native dispatch, and `--pickup_rsi` enables the training sampler with PickUp-only selection. `--steps_per_env`, `--num_envs`, `--seed`, `--episode_length_s`, `--stable_duration_s`, `--student_initial_stand_duration_s`, `--no_amp`, and `--collect_only` remain independent controls.
@@ -96,13 +96,13 @@ A = full Approach/20s/0.3s gate/0.5s Stand; B = PickUp RSI/20s/0.3s/0.5s; C = Pi
 Short Student PPO-only smoke (500 collected control steps per environment, at most five updates):
 
 ```bash
-python legged_gym/scripts/train_mixed_handoff.py --teacher_checkpoint logs/minimal_carrybox/Oct25_19-58-13_loco_pickup_hold_resume/model_17000.pt --allow_legacy_contract --seed 1 --ablation D --no_amp --headless --max_iterations 5 --max_optimizer_updates 5 --log_dir logs/efficiency_ppo
+python legged_gym/scripts/train_mixed_handoff.py --teacher_checkpoint logs/minimal_carrybox/Oct25_19-58-13_loco_pickup_hold_resume/model_17000.pt --num_envs 16 --seed 1 --ablation D --no_amp --headless --max_iterations 5 --max_optimizer_updates 5 --log_dir logs/efficiency_ppo
 ```
 
 Short Student PPO + 540D AMP smoke, same limits:
 
 ```bash
-python legged_gym/scripts/train_mixed_handoff.py --teacher_checkpoint logs/minimal_carrybox/Oct25_19-58-13_loco_pickup_hold_resume/model_17000.pt --allow_legacy_contract --seed 1 --ablation D --headless --max_iterations 5 --max_optimizer_updates 5 --log_dir logs/efficiency_amp
+python legged_gym/scripts/train_mixed_handoff.py --teacher_checkpoint logs/minimal_carrybox/Oct25_19-58-13_loco_pickup_hold_resume/model_17000.pt --num_envs 16 --seed 1 --ablation D --headless --max_iterations 5 --max_optimizer_updates 5 --log_dir logs/efficiency_amp
 ```
 
 Both smoke runs finish at collection iteration 5 and save `model_5.pt`. Check that `optimizer_updates > 0`, `optimizer_steps > 0`, Student-valid count is nonzero, and AMP-valid count is nonzero for an actual discriminator update. Zero counts are diagnostic results, not grounds to bypass the gate or disable physical failure. Student initialization defaults to the same `model_17000.pt` Teacher checkpoint in all commands; `--student_init_checkpoint` can explicitly select a compatible separate initialization.
@@ -110,7 +110,7 @@ Both smoke runs finish at collection iteration 5 and save `model_5.pt`. Check th
 Full Approach Viewer using the saved Student, standard gate/Stand defaults and mixed commands:
 
 ```bash
-python legged_gym/scripts/play_mixed_handoff.py --teacher_checkpoint logs/minimal_carrybox/Oct25_19-58-13_loco_pickup_hold_resume/model_17000.pt --student_checkpoint logs/efficiency_amp/model_5.pt --allow_legacy_contract --num_envs 1 --seed 1 --mode mixed --steps 3000 --csv logs/efficiency_viewer.csv
+python legged_gym/scripts/play_mixed_handoff.py --teacher_checkpoint logs/minimal_carrybox/Oct25_19-58-13_loco_pickup_hold_resume/model_17000.pt --student_checkpoint logs/efficiency_amp/model_5.pt --num_envs 1 --seed 1 --mode mixed --steps 3000 --csv logs/efficiency_viewer.csv
 ```
 
 For full Approach evaluation with candidate gate/command timing, append `--stable_duration_s 0.1 --student_initial_stand_duration_s 0.0` to that Viewer command. `--mode stand` and `--mode fixed --fixed_command 0.8 0 0` remain controlled evaluation options. The Viewer never defaults to RSI. For a visible PPO smoke, omit `--headless`; no address/environment setup command is needed here.
@@ -146,6 +146,6 @@ The approximately 80-column panel follows `HIMOnPolicyRunner.log()` with a hash 
 
 Collection and learning use `time.perf_counter()` with CUDA synchronization at timing boundaries on the runner/environment devices. FPS follows native PhysHSI semantics: collected transitions divided by collection plus learning time. Total time is elapsed wall time for the current `learn()` invocation; ETA extrapolates the remaining collection-iteration budget from this invocation, so resumed iteration counts do not distort it. A final panel has zero ETA, including an optimizer-limit stop. Lifetime timesteps and actual update counts use the existing resumed counters. Checkpoint format and loading rules are unchanged; older runner configurations default to the 100-iteration logging interval.
 
-Every collection iteration still writes all TensorBoard scalars and available histograms, flushes the writer and appends the complete scalar dictionary to `training_metrics.jsonl`. The sparse physical event file remains unchanged. Existing training and Viewer commands above need no additional flags.
+Every collection iteration writes TensorBoard scalars, flushes the writer and appends the scalar dictionary to `training_metrics.jsonl`. Detailed physical events and histograms require `--detailed_handoff_events`. Current production defaults and metric scopes are documented in [mixed_handoff_minimal_refactor.md](mixed_handoff_minimal_refactor.md).
 
 Logger validation: **89 Scope 1/2/3 and logger tests passed (18.672 seconds)** on CPU. Added coverage checks panel width/fields, `N/A`, 100/200/final cadence, early optimizer-limit completion, independent save/TensorBoard frequencies, preserved event/metrics files, deterministic timing/FPS, CUDA synchronization calls and legacy resume. With the same seed, logging intervals 1 and 100 produce exactly equal Student weights and identical PPO update/optimizer-step counts. CUDA synchronization is mock-tested here; actual Isaac Gym/GPU execution remains unexecuted on this host.

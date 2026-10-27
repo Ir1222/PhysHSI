@@ -44,7 +44,6 @@ def motion_classes():
 
 
 CarryWithMotionLib, validate_carrywith_config = motion_classes()
-CONTRACT = dict(actor_obs=738, critic_obs=126, actions=29, history_frames=6, activation="elu")
 
 
 def actor_critic():
@@ -155,7 +154,7 @@ class TrainingTests(unittest.TestCase):
             self.source.std.fill_(.31)
             for p in self.source.critic.parameters():
                 p.fill_(9.)
-        torch.save(dict(model_state_dict=self.source.state_dict(), scope1_contract=CONTRACT), self.path)
+        torch.save(dict(model_state_dict=self.source.state_dict()), self.path)
 
     def tearDown(self):
         self.temp.cleanup()
@@ -163,9 +162,15 @@ class TrainingTests(unittest.TestCase):
 
     def runner(self, amp=True, steps=14, normalize=False, initialize=True):
         return MixedHandoffOnPolicyRunner(TensorEnvironment(), configuration(amp, steps, normalize),
-                                          self.path, CONTRACT, expert=Expert() if amp else None, initialize=initialize)
+                                          self.path, expert=Expert() if amp else None, initialize=initialize)
 
     def test_initialization_storage_critic_std_and_optimizer_isolation(self):
+        # A native checkpoint needs no additional metadata, and its AMP and
+        # optimizer payloads must not be imported into a fresh Student.
+        native = torch.load(self.path, weights_only=False)
+        native.update(amp_state_dict={"invalid_teacher_amp": torch.tensor(999.)},
+                      optimizer_state_dict={"invalid_teacher_optimizer": True})
+        torch.save(native, self.path)
         runner = self.runner()
         student = runner.alg.actor_critic
         for teacher, actor in zip(runner.teacher.parameters(), student.actor.parameters()):
@@ -176,6 +181,7 @@ class TrainingTests(unittest.TestCase):
         optimized = {id(p) for g in runner.alg.optimizer.param_groups for p in g["params"]}
         self.assertFalse(optimized & {id(p) for p in runner.teacher.parameters()})
         self.assertEqual(optimized, {id(p) for p in student.parameters()} | {id(p) for p in runner.alg.amp.parameters()})
+        self.assertFalse(runner.alg.optimizer.state)
         runner.assert_teacher_frozen()
 
     def test_missing_or_incompatible_std_uses_configured_std_and_bad_std_rejected(self):
@@ -183,13 +189,13 @@ class TrainingTests(unittest.TestCase):
         checkpoint["model_state_dict"].pop("std")
         torch.save(checkpoint, self.path)
         ac = actor_critic()
-        metadata = initialize_student(ac, self.path, CONTRACT)
+        metadata = initialize_student(ac, self.path)
         self.assertTrue(torch.equal(ac.std, torch.full((29,), .4)))
         self.assertEqual(metadata["action_std"], "configured init_noise_std")
         checkpoint["model_state_dict"]["std"] = torch.full((29,), -1.)
         torch.save(checkpoint, self.path)
         with self.assertRaisesRegex(ValueError, "positive"):
-            initialize_student(ac, self.path, CONTRACT)
+            initialize_student(ac, self.path)
 
     def test_valid_ppo_and_amp_change_student_and_discriminator_only(self):
         runner = self.runner()
@@ -370,7 +376,7 @@ class TrainingTests(unittest.TestCase):
         runner.collection_iteration = 3
         saved = Path(self.temp.name) / "student.pt"
         runner.save(saved)
-        actor, _ = load_actor(saved, CONTRACT)
+        actor, _ = load_actor(saved)
         for a, b in zip(actor.parameters(), runner.alg.actor_critic.actor.parameters()):
             self.assertTrue(torch.equal(a, b))
         resumed = self.runner(normalize=True, initialize=False)
@@ -401,6 +407,57 @@ class TrainingTests(unittest.TestCase):
             torch.save(changed, path)
             with self.assertRaisesRegex(ValueError, message):
                 runner.load(path)
+
+    def test_resume_optional_legacy_metadata_and_runtime_checks(self):
+        runner = self.runner(normalize=True)
+        path = Path(self.temp.name) / "student.pt"
+        runner.save(path)
+        checkpoint = torch.load(path, weights_only=False)
+        self.assertNotIn("scope1_contract", checkpoint)
+        # Model an old Student export with runtime metadata under the old name.
+        old = copy.deepcopy(checkpoint)
+        old["scope1_contract"] = old.pop("environment_signature")
+        torch.save(old, path)
+        runner.load(path)
+        load_actor(path)  # Viewer shares this Actor-only loading path.
+        old["scope1_contract"].pop("dt")
+        torch.save(old, path)
+        runner.load(path)  # Missing optional metadata does not block resume.
+        for section, key, value in (("algorithm", "learning_rate", .9),
+                                    ("policy", "activation", "relu"),
+                                    ("amp", "amp_coef", .9),
+                                    ("environment", "control", {"action_scale": .9}),
+                                    ("environment", "init_state", {"default_joint_angles": {"joint": 1.}})):
+            changed = copy.deepcopy(old)
+            changed["train_cfg"].setdefault(section, {})[key] = value
+            torch.save(changed, path)
+            with self.assertRaisesRegex(ValueError, "configuration differs"):
+                runner.load(path)
+        for legacy in (False, True):
+            changed = copy.deepcopy(checkpoint)
+            if legacy:
+                changed["scope1_contract"] = changed.pop("environment_signature")
+            changed["scope1_contract" if legacy else "environment_signature"]["dt"] = .04
+            torch.save(changed, path)
+            with self.assertRaisesRegex(ValueError, "runtime environment"):
+                runner.load(path)
+
+    def test_unlimited_updates_and_real_kl_metrics(self):
+        runner = self.runner(amp=False, steps=14)
+        losses = []
+        original = runner.alg.ppo_loss
+
+        def record(batch):
+            result = original(batch)
+            losses.append(float(result[1]["kl"]))
+            return result
+
+        with patch.object(runner.alg, "ppo_loss", side_effect=record), patch.object(runner, "log") as log:
+            runner.learn(7, max_optimizer_updates=None)
+        self.assertEqual(runner.collection_iteration, 7)
+        self.assertEqual(runner.alg.optimizer_updates, 7)
+        self.assertAlmostEqual(log.call_args.args[0]["kl"], sum(losses[-2:]) / 2)
+        self.assertEqual(log.call_args.args[0]["learning_rate"], runner.alg.learning_rate)
 
     def test_bounded_collection_distinguishes_empty_collections_and_updates(self):
         runner = self.runner(amp=False, steps=2)
@@ -515,6 +572,9 @@ class TrainingRegressionTests(unittest.TestCase):
             path = Path(directory) / "teacher.pt"
             path.touch()
             base = ["--teacher_checkpoint", str(path)]
+            defaults = self.parse(base)
+            self.assertEqual((defaults.num_envs, defaults.steps_per_env, defaults.max_iterations), (4096, 100, 20000))
+            self.assertIsNone(defaults.max_optimizer_updates)
             args = self.parse(base + ["--student_init_checkpoint", str(path), "--headless", "--no_amp",
                                      "--steps_per_env", "20", "--max_optimizer_updates", "1", "--pipeline", "cpu"])
             self.assertEqual(args.steps_per_env, 20)
@@ -525,7 +585,7 @@ class TrainingRegressionTests(unittest.TestCase):
             self.assertTrue(resumed.resume)
             for options in (["--resume"], ["--resume_path", "student.pt"],
                             ["--resume", "--resume_path", "student.pt", "--student_init_checkpoint", str(path)],
-                            ["--num_envs", "0"]):
+                            ["--num_envs", "0"], ["--max_optimizer_updates", "0"]):
                 with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                     self.parse(base + options)
 
@@ -536,7 +596,7 @@ class TrainingRegressionTests(unittest.TestCase):
                             ["MixedHandoffTrainingCfg", "MixedHandoffCfgPPO"], ns)
         training = ns["MixedHandoffTrainingCfg"]()
         viewer = ns["MixedHandoffCfg"]()
-        self.assertEqual(training.env.num_envs, 16)
+        self.assertEqual(training.env.num_envs, 4096)
         self.assertFalse(training.env.test)
         self.assertEqual(viewer.env.num_envs, 1)
         self.assertTrue(viewer.env.test)
@@ -552,6 +612,11 @@ class TrainingRegressionTests(unittest.TestCase):
         self.assertEqual(ns["MixedHandoffCfgPPO"]().runner.num_steps_per_env, 100)
         self.assertEqual(ns["MixedHandoffCfgPPO"]().runner.terminal_log_interval, 100)
         self.assertEqual(ns["MixedHandoffCfgPPO"]().runner.save_interval, 500)
+        self.assertEqual(ns["MixedHandoffCfgPPO"]().runner.max_iterations, 20000)
+        self.assertIsNone(ns["MixedHandoffCfgPPO"]().runner.max_optimizer_updates)
+        native = ns["G1CfgPPO"]()
+        for name in ("num_steps_per_env", "max_iterations", "save_interval"):
+            self.assertEqual(getattr(ns["MixedHandoffCfgPPO"]().runner, name), getattr(native.runner, name))
         for group in ("student_rewards", "student_termination", "control", "sim", "domain_rand", "dataset"):
             def values(obj):
                 return {k: values(getattr(obj, k)) if hasattr(getattr(obj, k), "__dict__") else getattr(obj, k)
@@ -561,6 +626,41 @@ class TrainingRegressionTests(unittest.TestCase):
         self.assertIn("runner = HIMOnPolicyRunner", registry)
         script = (ROOT / "legged_gym/legged_gym/scripts/train_mixed_handoff.py").read_text()
         self.assertIn("task_registry.make_alg_runner", script)
+
+    def test_native_registry_accepts_unlimited_updates_and_explicit_overrides(self):
+        ns = dict(config_namespace)
+        classes_from_source(ROOT / "legged_gym/legged_gym/envs/g1/carrybox_config.py", ["G1CfgPPO"], ns)
+        classes_from_source(ROOT / "legged_gym/legged_gym/envs/g1/carrybox_mixed_handoff_config.py",
+                            ["MixedHandoffTrainingCfg", "MixedHandoffCfgPPO"], ns)
+
+        def values(obj):
+            if not hasattr(obj, "__dict__"):
+                return obj
+            return {k: values(getattr(obj, k)) for k in dir(obj) if not k.startswith("_")}
+
+        ns.update(Tuple=tuple, VecEnv=object, LeggedRobotCfg=object, LeggedRobotCfgPPO=object, HIMOnPolicyRunner=object,
+                  class_to_dict=values, LEGGED_GYM_ROOT_DIR=str(ROOT / "legged_gym"))
+        classes_from_source(ROOT / "legged_gym/legged_gym/utils/task_registry.py", ["TaskRegistry"], ns)
+        # Adapt only unavailable simulator imports; execute the actual factory.
+        motion_module = NS(CarryWithMotionLib=CarryWithMotionLib, validate_carrywith_config=validate_carrywith_config)
+        with patch.dict(sys.modules, {"legged_gym.envs.motionlib.motionlib_carrywith": motion_module}), \
+                patch("rsl_rl.runners.mixed_handoff_on_policy_runner.MixedHandoffOnPolicyRunner") as create:
+            registry = ns["TaskRegistry"]()
+            cfg = ns["MixedHandoffCfgPPO"]()
+            cfg.amp.enabled = False
+            env = NS(cfg=ns["MixedHandoffTrainingCfg"]())
+            args = NS(rl_device="cpu", max_optimizer_updates=None)
+            registry._make_mixed_handoff_runner(env, cfg, args, None)
+            passed = create.call_args.args[1]["runner"]
+            self.assertIsNone(passed["max_optimizer_updates"])
+            self.assertEqual(passed["max_iterations"], 20000)
+            args.max_optimizer_updates, args.steps_per_env = 3, 20
+            registry._make_mixed_handoff_runner(env, cfg, args, None)
+            passed = create.call_args.args[1]["runner"]
+            self.assertEqual((passed["max_optimizer_updates"], passed["num_steps_per_env"]), (3, 20))
+            args.max_optimizer_updates = 0
+            with self.assertRaisesRegex(ValueError, "max_optimizer_updates"):
+                registry._make_mixed_handoff_runner(env, cfg, args, None)
 
 
 if __name__ == "__main__":

@@ -35,10 +35,8 @@ def file_identity(path):
     return dict(path=str(path), sha256=digest.hexdigest())
 
 
-def initialize_student(student, path, contract, device="cpu", allow_legacy_contract=False):
-    source, spec = load_actor(path, contract, device, allow_legacy_contract)
-    if spec["dims"] != [738, 512, 256, 256, 29]:
-        raise ValueError("Student initialization requires 738->512->256->256->29 ELU Actor")
+def initialize_student(student, path, device="cpu"):
+    source, _ = load_actor(path, device)
     student.actor.load_state_dict(source.state_dict(), strict=True)
     std = read_checkpoint(path)["model_state_dict"].get("std")
     std_source = "configured init_noise_std"
@@ -52,26 +50,34 @@ def initialize_student(student, path, contract, device="cpu", allow_legacy_contr
 
 
 class MixedHandoffOnPolicyRunner:
-    def __init__(self, env, train_cfg, teacher_checkpoint, contract,
+    def __init__(self, env, train_cfg, teacher_checkpoint,
                  student_init_checkpoint=None, expert=None, log_dir=None,
-                 device="cpu", allow_legacy_contract=False, initialize=True):
-        self.env, self.train_cfg, self.contract = env, train_cfg, contract
+                 device="cpu", initialize=True):
+        self.env, self.train_cfg = env, train_cfg
         self.device, self.log_dir = torch.device(device), Path(log_dir) if log_dir else None
         self.cfg, amp_cfg = train_cfg["runner"], train_cfg["amp"]
+        # Retain runtime semantics that static network dimensions cannot check.
+        self.environment_signature = dict(dof_names=list(getattr(env, "dof_names", [])),
+                                          dt=getattr(env, "dt", .02))
+        self.detailed_diagnostics = self.cfg.get("detailed_handoff_events", False)
+        for name in ("num_steps_per_env", "save_interval", "max_iterations", "max_optimizer_updates"):
+            value = self.cfg.get(name)
+            if value is None and name in ("max_iterations", "max_optimizer_updates"):
+                continue
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(name + " must be a positive integer")
         self.terminal_log_interval = self.cfg.get("terminal_log_interval", 100)
         if (isinstance(self.terminal_log_interval, bool)
                 or not isinstance(self.terminal_log_interval, int) or self.terminal_log_interval < 1):
             raise ValueError("terminal_log_interval must be a positive integer")
         if not 0 <= amp_cfg["amp_coef"] <= 1 or amp_cfg["reward_scale"] < 0:
             raise ValueError("AMP reward requires 0 <= amp_coef <= 1 and nonnegative reward_scale")
-        self.teacher, teacher_spec = load_actor(teacher_checkpoint, contract, device, allow_legacy_contract)
-        if teacher_spec["dims"] != [738, 512, 256, 256, 29]:
-            raise ValueError("Teacher must retain the audited 738->512->256->256->29 Actor")
+        self.teacher, _ = load_actor(teacher_checkpoint, device)
         self.teacher_identity = file_identity(teacher_checkpoint)
         self.teacher_snapshot = {k: p.detach().clone() for k, p in self.teacher.state_dict().items()}
         ac = ActorCritic(738, 126, 6, 29, **train_cfg["policy"]).to(device)
         self.student_init = initialize_student(ac, student_init_checkpoint or teacher_checkpoint,
-                                              contract, device, allow_legacy_contract) if initialize else None
+                                              device) if initialize else None
         amp = AMP(540, amp_cfg["amp_coef"], device=device).to(device) if amp_cfg["enabled"] else None
         normalizer = None
         if amp is not None and expert is None:
@@ -108,7 +114,7 @@ class MixedHandoffOnPolicyRunner:
     @torch.no_grad()
     def collect_step(self):
         env, ac = self.env, self.alg.actor_critic
-        student = (env.handoff.phase.to(self.device) == STUDENT_CONTROL).clone()
+        student = env.handoff.phase.to(self.device) == STUDENT_CONTROL
         n = env.num_envs
         actions = torch.zeros(n, 29, device=self.device)
         # Teacher rows are placeholders, never sampled or evaluated by Student.
@@ -129,7 +135,7 @@ class MixedHandoffOnPolicyRunner:
             raise RuntimeError("Pre-step phase and executed action ownership differ")
         obs, critic = obs.to(self.device).clone(), critic.to(self.device).clone()
         dones = dones.to(self.device).bool().clone()
-        task_reward = task_reward.to(self.device).clone()
+        task_reward = task_reward.to(self.device)
         timeouts = diag["timeout"].to(self.device).bool()
         failures = diag["failure"].to(self.device).bool()
         next_student = env.handoff.phase.to(self.device) == STUDENT_CONTROL
@@ -179,13 +185,18 @@ class MixedHandoffOnPolicyRunner:
             "episode/teacher_steps": self.episode_teacher_steps[dones].clone(),
             "episode/teacher_warmup_s": (self.episode_teacher_steps[dones] * dt).clone(),
             "episode/zero_student_fraction": (~reached[dones]).float(),
+            # Include completed Teacher-only episodes with ratio zero. Counters
+            # persist across rollouts and are cleared only for asynchronous dones.
+            "episode_student_fraction": (self.episode_student_steps[dones] /
+                (self.episode_teacher_steps[dones] + self.episode_student_steps[dones]).clamp_min(1)),
             "student/segment_frames": self.episode_student_steps[segments].clone(),
+            "student/segment_duration_s": self.episode_student_steps[segments] * dt,
             "student/segment_under_10_fraction": (self.episode_student_steps[segments] < 10).float(),
             "student/episode_reached_amp_fraction": (self.episode_amp_steps[segments] > 0).float(),
             # Timeout is a right-censored survival observation, even though its
             # episode has ended. Physical failures are observed survival events.
             "student/completed_survival_s": (self.episode_student_steps[segments & failures] * dt).clone(),
-            "student/censored_timeout_s": (self.episode_student_steps[segments & ~failures] * dt).clone(),
+            "student/censored_timeout_s": (self.episode_student_steps[segments & timeouts & ~failures] * dt).clone(),
             "termination/teacher_before_handoff": failed[dones].float(),
             "termination/teacher_physical_failure": (failures & ~student)[dones].float(),
             "termination/episode_timeout": timeouts[dones].float(),
@@ -200,22 +211,15 @@ class MixedHandoffOnPolicyRunner:
                     "base_linear_velocity", "base_angular_velocity", "box_linear_velocity", "box_angular_velocity",
                     "box_tilt", "teacher_last_action", "student_first_action", "action_discontinuity",
                     "action_discontinuity_l2")
-        for key in physical:
+        for key in physical if self.detailed_diagnostics else ():
             if key in diag:
                 mask = first if key.startswith(("student_first", "action_discontinuity")) else trigger
                 samples["gate/" + key] = diag[key].to(self.device)[mask].float().flatten()
-        if self.log_dir:
+        if self.log_dir and self.detailed_diagnostics:
             event_ids = (trigger | first | dones).nonzero().flatten()
             if event_ids.numel():
-                # Index on the source GPU before copying; production records
-                # contain only ownership, contact and terminal information.
-                fields = ("executed_phase", "executed_command", "handoff_trigger", "first_student_step",
-                          "handoff_time", "failure", "timeout", "box_height", "hand_contact",
-                          "student/termination_reason")
-                selected = diag if self.cfg.get("detailed_handoff_events", False) else {
-                    k: diag[k] for k in fields if k in diag}
                 rows = {k: v.detach().index_select(0, event_ids.to(v.device)).cpu().tolist()
-                        for k, v in selected.items()}
+                        for k, v in diag.items()}
                 events = event_ids.cpu().tolist()
                 first_rows = first[event_ids].cpu().tolist()
                 with (self.log_dir / "handoff_events.jsonl").open("a", encoding="utf-8") as stream:
@@ -244,10 +248,10 @@ class MixedHandoffOnPolicyRunner:
             setattr(self, name, getattr(self, name) + count)
         self._pending_counts.zero_()
 
-    def assert_teacher_frozen(self):
+    def assert_teacher_frozen(self, check_weights=True):
         if self.teacher.training or any(p.requires_grad or p.grad is not None for p in self.teacher.parameters()):
             raise RuntimeError("Teacher is no longer frozen")
-        if any(not torch.equal(p, self.teacher_snapshot[k]) for k, p in self.teacher.state_dict().items()):
+        if check_weights and any(not torch.equal(p, self.teacher_snapshot[k]) for k, p in self.teacher.state_dict().items()):
             raise RuntimeError("Frozen Teacher weights changed")
 
     def _synchronize_timing(self):
@@ -277,9 +281,13 @@ class MixedHandoffOnPolicyRunner:
                  row("Surrogate loss", number(metrics.get("surrogate"))),
                  row("Mean action noise std", number(metrics.get("Policy/mean_noise_std"), ".2f")),
                  row("Learning rate", number(metrics.get("learning_rate"), ".2e")),
+                 row("PPO KL", number(metrics.get("kl"), ".6f")),
                  row("Mean Student task reward", number(metrics.get("performance/task_reward"))),
                  row("Mean AMP reward", number(metrics.get("performance/amp_reward_valid"))),
                  row("Student-valid ratio", number(metrics.get("student_valid_ratio"), ".2%")),
+                 row("Cumulative Student ratio", number(metrics.get("student_step_fraction"), ".2%")),
+                 row("Completed episode Student ratio", number(metrics.get("episode_student_fraction")
+                     if metrics.get("episode_student_fraction_count", 0) else None, ".2%")),
                  row("AMP-valid fraction", number(metrics.get("amp_valid_fraction")
                                                  if metrics.get("student_valid_count", 0) else None, ".2%")),
                  row("Handoff success rate", number(metrics.get("handoff_success_rate")
@@ -293,6 +301,11 @@ class MixedHandoffOnPolicyRunner:
         print("\n".join(lines), flush=True)
 
     def learn(self, iterations, optimize=True, max_optimizer_updates=None):
+        if isinstance(iterations, bool) or not isinstance(iterations, int) or iterations < 1:
+            raise ValueError("iterations must be a positive integer")
+        if max_optimizer_updates is not None and (isinstance(max_optimizer_updates, bool)
+                or not isinstance(max_optimizer_updates, int) or max_optimizer_updates < 1):
+            raise ValueError("max_optimizer_updates must be None or a positive integer")
         if self.obs is None:
             self.reset()
         start_updates = self.alg.optimizer_updates
@@ -318,10 +331,9 @@ class MixedHandoffOnPolicyRunner:
                                 stats[k][0] += reduced
                                 stats[k][1] += v.numel()
                             if k in ("handoff_time", "episode/teacher_steps", "episode/teacher_warmup_s",
-                                     "student/segment_frames", "student/completed_survival_s", "student/censored_timeout_s"):
+                                     "student/segment_frames", "student/segment_duration_s",
+                                     "student/completed_survival_s", "student/censored_timeout_s"):
                                 distributions.setdefault(k, []).append(v.detach().float())
-                count = int(self.storage.data["student_valid"][:self.storage.step].sum())
-                amp_count = len(self.storage.amp_samples())
                 self._synchronize_timing()
                 learning_start = time.perf_counter()
                 collection_time = learning_start - collection_start
@@ -329,13 +341,16 @@ class MixedHandoffOnPolicyRunner:
                 if optimize:
                     metrics = self.alg.update(self.storage)
                 else:
+                    count = int(self.storage.data["student_valid"][:self.storage.step].sum())
+                    amp_count = int(self.storage.data["amp_valid"][:self.storage.step].sum())
                     self.storage.clear()
                     metrics = dict(student_valid_count=count, amp_valid_count=amp_count, updated=0)
                 self._synchronize_timing()
                 learning_time = time.perf_counter() - learning_start
-                self.assert_teacher_frozen()
+                self.assert_teacher_frozen(check_weights=self.detailed_diagnostics)
                 self._flush_counts()
                 self.collection_iteration += 1
+                count, amp_count = metrics["student_valid_count"], metrics["amp_valid_count"]
                 attempts = self.handoff_successes + self.handoff_failures
                 metrics.update(collection_iterations=self.collection_iteration, optimizer_updates=self.alg.optimizer_updates,
                                optimizer_steps=self.alg.optimizer_steps, teacher_steps=self.teacher_steps, student_steps=self.student_steps,
@@ -343,6 +358,7 @@ class MixedHandoffOnPolicyRunner:
                                student_step_fraction=self.student_steps / max(1, self.teacher_steps+self.student_steps),
                                student_valid_ratio=count / (self.env.num_envs * self.cfg["num_steps_per_env"]),
                                amp_valid_fraction=amp_count / max(1, count),
+                               cumulative_amp_valid_fraction=self.amp_steps / max(1, self.student_steps),
                                handoff_success_rate=self.handoff_successes / max(1, attempts),
                                handoff_failure_rate=self.handoff_failures / max(1, attempts))
                 active = self.episode_student_steps > 0
@@ -355,12 +371,20 @@ class MixedHandoffOnPolicyRunner:
                     metrics["performance/" + k] = total / number
                     if "reward" in k:
                         metrics["performance/" + k + "_std"] = max(0., square / number - (total / number)**2)**.5
+                # These means/counts cover episodes/segments ending in THIS
+                # rollout, including portions collected in earlier rollouts.
+                metrics["episode_student_fraction"] = metrics.get("performance/episode_student_fraction", 0.)
+                metrics["episode_student_fraction_count"] = stats.get("episode_student_fraction", (None, 0))[1]
+                for key in ("student/segment_duration_s", "student/completed_survival_s", "student/censored_timeout_s"):
+                    metrics[key + "/count"] = stats.get(key, (None, 0))[1]
+                    if key in stats:
+                        metrics[key] = metrics["performance/" + key]
                 for k, batches in distributions.items():
                     values = torch.cat(batches).cpu()
                     metrics["distribution/" + k + "/count"] = values.numel()
                     for label, q in (("min", 0.), ("p10", .1), ("median", .5), ("p90", .9), ("max", 1.)):
                         metrics["distribution/" + k + "/" + label] = float(torch.quantile(values, q))
-                    if self.writer:
+                    if self.writer and self.detailed_diagnostics:
                         self.writer.add_histogram("distribution/" + k, values, self.collection_iteration)
                 elapsed_time = time.perf_counter() - run_start
                 reached_limit = (max_optimizer_updates is not None
@@ -387,7 +411,8 @@ class MixedHandoffOnPolicyRunner:
                     self.save(self.log_dir / f"model_{self.collection_iteration}.pt")
                 if reached_limit:
                     break
-            if self.log_dir:
+            self.assert_teacher_frozen()
+            if self.log_dir and self.collection_iteration % self.cfg["save_interval"] != 0:
                 self.save(self.log_dir / f"model_{self.collection_iteration}.pt")
         finally:
             if self.writer:
@@ -396,7 +421,7 @@ class MixedHandoffOnPolicyRunner:
     def save(self, path):
         self._flush_counts()
         normalizer = self.alg.amp_normalizer
-        torch.save(dict(format="mixed_handoff_student_v1", scope1_contract=self.contract,
+        torch.save(dict(format="mixed_handoff_student_v1", environment_signature=self.environment_signature,
                         training_contract=TRAINING_CONTRACT, train_cfg=self.train_cfg,
                         teacher=self.teacher_identity, student_init=self.student_init,
                         expert=self.alg.motion_buffer.identity if self.alg.motion_buffer else None,
@@ -415,8 +440,21 @@ class MixedHandoffOnPolicyRunner:
         checkpoint = read_checkpoint(path)
         if checkpoint.get("format") != "mixed_handoff_student_v1":
             raise ValueError("Full Student resume requires a mixed_handoff_student_v1 checkpoint; use --student_init_checkpoint for Teacher weights")
-        if checkpoint["scope1_contract"] != self.contract or checkpoint["training_contract"] != TRAINING_CONTRACT:
+        if checkpoint["training_contract"] != TRAINING_CONTRACT:
             raise ValueError("Student resume observation/AMP contracts differ")
+        saved_signature = checkpoint.get("environment_signature")
+        if saved_signature is not None and saved_signature != self.environment_signature:
+            raise ValueError("Student resume runtime environment signature differs")
+        # Old Student exports may carry these runtime checks in scope1_contract.
+        # Its synthetic feature descriptions are no longer a loading requirement.
+        legacy = checkpoint.get("scope1_contract")
+        if saved_signature is None and isinstance(legacy, dict):
+            for key, current in self.environment_signature.items():
+                if key in legacy and legacy[key] != current:
+                    raise ValueError("Student resume runtime environment differs: " + key)
+            angles = self.train_cfg.get("environment", {}).get("init_state", {}).get("default_joint_angles")
+            if "default_joint_angles" in legacy and legacy["default_joint_angles"] != angles:
+                raise ValueError("Student resume default joint angles differ")
         if checkpoint["teacher"]["sha256"] != self.teacher_identity["sha256"]:
             raise ValueError("Student resume frozen Teacher identity differs")
         for key in ("algorithm", "policy", "amp"):
@@ -426,7 +464,7 @@ class MixedHandoffOnPolicyRunner:
                 current_cfg = {k: v for k, v in current_cfg.items() if k != "expert_config"}
             if saved_cfg != current_cfg:
                 raise ValueError("Student resume configuration differs: " + key)
-        for key in ("control", "sim", "handoff", "student_rewards", "student_termination", "domain_rand", "asset", "commands", "normalization", "dataset"):
+        for key in ("control", "sim", "init_state", "handoff", "student_rewards", "student_termination", "domain_rand", "asset", "commands", "normalization", "dataset"):
             if checkpoint["train_cfg"].get("environment", {}).get(key) != self.train_cfg.get("environment", {}).get(key):
                 raise ValueError("Student resume environment configuration differs: " + key)
         # Reset-window semantics belong to the environment contract; printing
@@ -437,6 +475,8 @@ class MixedHandoffOnPolicyRunner:
         if rsi_settings(checkpoint["train_cfg"]) != rsi_settings(self.train_cfg):
             raise ValueError("Student resume environment configuration differs: pickup_rsi")
         expert = self.alg.motion_buffer.identity if self.alg.motion_buffer else None
+        if (checkpoint["expert"] is None) != (expert is None):
+            raise ValueError("Student resume expert identity differs")
         if checkpoint["expert"] is not None:
             # Allow moving a checkout; source hashes, weights and timing must match.
             saved_expert = {k: v for k, v in checkpoint["expert"].items() if k != "config"}

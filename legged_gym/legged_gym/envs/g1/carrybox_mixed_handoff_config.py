@@ -64,7 +64,7 @@ class MixedHandoffCfg(G1Cfg):
 class MixedHandoffTrainingCfg(MixedHandoffCfg):
     """Candidate D; Viewer and original carrybox retain full Approach resets."""
     class env(MixedHandoffCfg.env):
-        num_envs = 16
+        num_envs = G1Cfg.env.num_envs
         episode_length_s = 20.0
         test = False
 
@@ -98,15 +98,14 @@ class MixedHandoffCfgPPO(G1CfgPPO):
     class runner(G1CfgPPO.runner):
         algorithm_class_name = "MixedHandoffPPO"
         num_steps_per_env = 100
-        max_iterations = 20  # collection iterations, including Teacher warmup
-        max_optimizer_updates = 5
+        max_iterations = G1CfgPPO.runner.max_iterations
+        max_optimizer_updates = None  # No extra limit on nonempty rollout updates.
         terminal_log_interval = 100
         save_interval = 500
         experiment_name = "mixed_handoff_student"
         run_name = "scope3"
         teacher_checkpoint = "{LEGGED_GYM_ROOT_DIR}/logs/minimal_carrybox/Oct25_19-58-13_loco_pickup_hold_resume/model_17000.pt"
         student_init_checkpoint = None  # Same pretrained Actor/std as Teacher.
-        allow_legacy_contract = False
         collect_only = False
         detailed_handoff_events = False
 

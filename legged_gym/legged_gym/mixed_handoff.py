@@ -1,7 +1,6 @@
 """Inference-only handoff state and Actor loading; no Isaac Gym dependency."""
 import math
 import re
-import warnings
 from dataclasses import dataclass
 
 import torch
@@ -111,12 +110,8 @@ class HandoffState:
         return switched
 
 
-def load_actor(path, expected_contract, device="cpu", allow_legacy_contract=False):
-    """Load only an unnormalized Sequential ELU Actor from a trusted checkpoint.
-
-    Tensor shapes cannot prove joint/feature ordering or activation. New exports
-    can embed scope1_contract; old source-audited exports require explicit opt-in.
-    """
+def load_actor(path, device="cpu"):
+    """Load the native PhysHSI Actor only; optional old metadata is ignored."""
     try:
         checkpoint = torch.load(path, map_location="cpu", weights_only=False)
     except TypeError:  # Isaac Gym installations with older torch
@@ -125,20 +120,6 @@ def load_actor(path, expected_contract, device="cpu", allow_legacy_contract=Fals
         raise ValueError(f"{path}: expected training checkpoint dictionary")
     if "handoff_contract" in checkpoint:
         raise ValueError(f"{path}: legacy handoff/action-adapter checkpoint is unsupported")
-    saved = checkpoint.get("scope1_contract")
-    if saved is not None:
-        if not isinstance(saved, dict):
-            raise ValueError(f"{path}: scope1_contract must be a dictionary")
-        if saved != expected_contract:
-            keys = sorted(k for k in set(saved) | set(expected_contract)
-                          if saved.get(k) != expected_contract.get(k))
-            raise ValueError(f"{path}: incompatible Actor semantics: {keys}")
-    elif not allow_legacy_contract:
-        raise ValueError(f"{path}: missing scope1_contract; audit joint/feature ordering and "
-                         "control conventions, then explicitly use --allow_legacy_contract")
-    else:
-        warnings.warn(f"{path}: semantics assumed from audited PhysHSI source; "
-                      "joint/feature ordering cannot be proven from weights alone")
     state = checkpoint.get("model_state_dict", {})
     if not isinstance(state, dict):
         raise ValueError(f"{path}: model_state_dict must be a dictionary")
@@ -158,8 +139,8 @@ def load_actor(path, expected_contract, device="cpu", allow_legacy_contract=Fals
         layers.append(nn.Linear(weight.shape[1], weight.shape[0]))
         if i + 1 < len(ids):
             layers.append(nn.ELU())
-    if dims[0] != 738 or dims[-1] != 29:
-        raise ValueError(f"{path}: Actor dimensions {dims}; required input=738, output=29")
+    if dims != [738, 512, 256, 256, 29]:
+        raise ValueError(f"{path}: Actor dimensions {dims}; required 738->512->256->256->29 ELU (output=29)")
     actor = nn.Sequential(*layers)
     try:
         actor.load_state_dict(actor_state, strict=True)
@@ -168,4 +149,4 @@ def load_actor(path, expected_contract, device="cpu", allow_legacy_contract=Fals
     if not all(torch.isfinite(p).all() for p in actor.parameters()):
         raise ValueError(f"{path}: non-finite Actor weights")
     actor.to(device).eval().requires_grad_(False)
-    return actor, {"dims": dims, "semantics": "verified" if saved else "source_assumption"}
+    return actor, {"dims": dims, "activation": "elu"}

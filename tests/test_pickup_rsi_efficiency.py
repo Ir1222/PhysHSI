@@ -17,7 +17,7 @@ from test_student_carry import fixture
 import test_mixed_handoff_training as training_tests
 from test_mixed_handoff_training import (CarryWithMotionLib,
                                          MixedHandoffOnPolicyRunner, TensorEnvironment, configuration,
-                                         actor_critic, CONTRACT)
+                                         actor_critic)
 from legged_gym.pickup_rsi import pickup_window_bounds, sample_pickup_time, pickup_box_velocity
 
 
@@ -217,14 +217,13 @@ class EfficiencyConfigTests(unittest.TestCase):
     def test_survival_diagnostics_distinguish_failures_timeouts_and_incomplete(self):
         with tempfile.TemporaryDirectory() as folder:
             checkpoint = Path(folder) / "teacher.pt"
-            torch.save(dict(model_state_dict=actor_critic().state_dict(), scope1_contract=CONTRACT), checkpoint)
+            torch.save(dict(model_state_dict=actor_critic().state_dict()), checkpoint)
             output = io.StringIO()
             with contextlib.redirect_stdout(output):
                 runner = MixedHandoffOnPolicyRunner(TensorEnvironment(), configuration(amp=False, steps=18),
-                                                    checkpoint, CONTRACT, log_dir=folder)
+                                                    checkpoint, log_dir=folder)
                 runner.learn(1, optimize=False)
-            events = [json.loads(line) for line in (Path(folder) / "handoff_events.jsonl").read_text().splitlines()]
-            self.assertTrue(any(e["handoff_trigger"] for e in events))
+            self.assertFalse((Path(folder) / "handoff_events.jsonl").exists())
             self.assertEqual(runner.episode_student_steps.tolist(), [0., 0.])
             self.assertEqual(runner.alg.optimizer_updates, 0)
             metrics = json.loads((Path(folder) / "training_metrics.jsonl").read_text().splitlines()[-1])
@@ -239,7 +238,7 @@ class EfficiencyConfigTests(unittest.TestCase):
             output = io.StringIO()
             with contextlib.redirect_stdout(output):
                 incomplete = MixedHandoffOnPolicyRunner(TensorEnvironment(), configuration(amp=False, steps=10),
-                                                        checkpoint, CONTRACT, log_dir=Path(folder) / "incomplete")
+                                                        checkpoint, log_dir=Path(folder) / "incomplete")
                 incomplete.learn(1, optimize=False)
             metrics = json.loads((Path(folder) / "incomplete/training_metrics.jsonl").read_text().splitlines()[-1])
             self.assertEqual(metrics["student_incomplete_segments"], 2)
@@ -256,9 +255,9 @@ class EfficiencyConfigTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as folder:
             teacher = Path(folder) / "teacher.pt"
-            torch.save(dict(model_state_dict=actor_critic().state_dict(), scope1_contract=CONTRACT), teacher)
+            torch.save(dict(model_state_dict=actor_critic().state_dict()), teacher)
             with contextlib.redirect_stdout(io.StringIO()):
-                runner = MixedHandoffOnPolicyRunner(ShortSegments(), configuration(amp=False, steps=6), teacher, CONTRACT)
+                runner = MixedHandoffOnPolicyRunner(ShortSegments(), configuration(amp=False, steps=6), teacher)
                 runner.reset()
                 samples = [runner.collect_step() for _ in range(6)]
             self.assertGreater(int(runner.storage.data["student_valid"][:6].sum()), 0)
@@ -270,13 +269,13 @@ class EfficiencyConfigTests(unittest.TestCase):
     def test_legacy_full_resume_and_new_rsi_window_validation(self):
         with tempfile.TemporaryDirectory() as folder:
             teacher, saved = Path(folder) / "teacher.pt", Path(folder) / "student.pt"
-            torch.save(dict(model_state_dict=actor_critic().state_dict(), scope1_contract=CONTRACT), teacher)
+            torch.save(dict(model_state_dict=actor_critic().state_dict()), teacher)
             with contextlib.redirect_stdout(io.StringIO()):
-                old = MixedHandoffOnPolicyRunner(TensorEnvironment(), configuration(amp=False), teacher, CONTRACT)
+                old = MixedHandoffOnPolicyRunner(TensorEnvironment(), configuration(amp=False), teacher)
                 old.save(saved)
                 cfg = configuration(amp=False)
                 cfg["environment"] = dict(pickup_rsi=dict(enabled=False, window="contact", contact_window_s=(-.2, .2)))
-                compatible = MixedHandoffOnPolicyRunner(TensorEnvironment(), cfg, teacher, CONTRACT)
+                compatible = MixedHandoffOnPolicyRunner(TensorEnvironment(), cfg, teacher)
                 compatible.load(saved)
                 cfg["environment"]["pickup_rsi"]["enabled"] = True
                 with self.assertRaisesRegex(ValueError, "pickup_rsi"):

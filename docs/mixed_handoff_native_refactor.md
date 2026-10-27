@@ -133,7 +133,7 @@ git pull --ff-only origin codex/minimal-carrybox-loco-pickup
 TEACHER=/home/han/pyx/PhysHSI-carrybox/legged_gym/logs/minimal_carrybox/Oct25_19-58-13_loco_pickup_hold_resume/model_17000.pt
 python legged_gym/legged_gym/scripts/play_mixed_handoff.py \
   --teacher_checkpoint "$TEACHER" --student_checkpoint "$TEACHER" \
-  --allow_legacy_contract --mode stand --num_envs 1 --steps 1000 \
+  --mode stand --num_envs 1 --steps 1000 \
   --csv logs/handoff_native_stand.csv
 ```
 

@@ -163,7 +163,6 @@ class TaskRegistry():
     def _make_mixed_handoff_runner(self, env, train_cfg, args, log_dir):
         from pathlib import Path
         from legged_gym.envs.motionlib.motionlib_carrywith import CarryWithMotionLib, validate_carrywith_config
-        from legged_gym.scripts.play_mixed_handoff import actor_contract
         from rsl_rl.runners.mixed_handoff_on_policy_runner import MixedHandoffOnPolicyRunner
 
         if getattr(args, "resume_path", None) and not train_cfg.runner.resume:
@@ -174,7 +173,7 @@ class TaskRegistry():
                 setattr(train_cfg.runner, name, value)
         if getattr(args, "steps_per_env", None) is not None:
             train_cfg.runner.num_steps_per_env = args.steps_per_env
-        for name in ("collect_only", "allow_legacy_contract"):
+        for name in ("collect_only", "detailed_handoff_events"):
             if getattr(args, name, False):
                 setattr(train_cfg.runner, name, True)
         if getattr(args, "no_amp", False):
@@ -182,7 +181,10 @@ class TaskRegistry():
         if train_cfg.runner.resume and train_cfg.runner.student_init_checkpoint:
             raise ValueError("Fresh Student initialization cannot be combined with resume")
         for name in ("num_steps_per_env", "max_iterations", "max_optimizer_updates"):
-            if getattr(train_cfg.runner, name) < 1:
+            value = getattr(train_cfg.runner, name)
+            if name == "max_optimizer_updates" and value is None:
+                continue
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise ValueError(name + " must be positive")
         teacher = train_cfg.runner.teacher_checkpoint.format(LEGGED_GYM_ROOT_DIR=LEGGED_GYM_ROOT_DIR)
         student = train_cfg.runner.student_init_checkpoint
@@ -201,9 +203,9 @@ class TaskRegistry():
                 env.cfg.rewards.thresh_robot2object, motion_root)
         cfg = class_to_dict(train_cfg)
         cfg["environment"] = class_to_dict(env.cfg)
-        return MixedHandoffOnPolicyRunner(env, cfg, teacher, actor_contract(env), student, expert,
+        return MixedHandoffOnPolicyRunner(env, cfg, teacher, student, expert,
             getattr(args, "log_dir", None) or log_dir, args.rl_device,
-            train_cfg.runner.allow_legacy_contract, initialize=not train_cfg.runner.resume)
+            initialize=not train_cfg.runner.resume)
 
 
 # make global task registry

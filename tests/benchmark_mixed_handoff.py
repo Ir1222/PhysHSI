@@ -13,7 +13,7 @@ from unittest.mock import patch
 import torch
 
 from test_mixed_handoff_training import (
-    actor_critic, configuration, CONTRACT, Expert, MixedHandoffOnPolicyRunner,
+    actor_critic, configuration, Expert, MixedHandoffOnPolicyRunner,
     TensorEnvironment,
 )
 from handoff_regression_support import regression_environment, apply_sample
@@ -30,19 +30,22 @@ def main():
         namespace = {"__name__": "baseline_runner"}
         source = subprocess.check_output(["git", "show", "6beaf95:rsl_rl/rsl_rl/runners/mixed_handoff_on_policy_runner.py"]).decode()
         exec(compile(source, "baseline_runner.py", "exec"), namespace)
+        from legged_gym.mixed_handoff import load_actor
+        namespace["load_actor"] = lambda path, contract, device, legacy: load_actor(path, device)
         Runner = namespace["MixedHandoffOnPolicyRunner"]
+    runner_args = ({},) if args.baseline else ()
     results = dict(device="cpu", torch=torch.__version__, seed=7, num_envs=2,
                    rollout_length=100, repeats=3, physics="synthetic tensor fixture")
     with tempfile.TemporaryDirectory() as folder, contextlib.redirect_stdout(io.StringIO()):
         checkpoint = Path(folder) / "teacher.pt"
         torch.manual_seed(7)
-        torch.save(dict(model_state_dict=actor_critic().state_dict(), scope1_contract=CONTRACT), checkpoint)
+        torch.save(dict(model_state_dict=actor_critic().state_dict()), checkpoint)
         for amp in (False, True):
             timings = []
             for repeat in range(4):  # warmup then three measured identical seeds
                 torch.manual_seed(7)
                 runner = Runner(TensorEnvironment(), configuration(amp, 100),
-                                                    checkpoint, CONTRACT, expert=Expert() if amp else None)
+                                                    checkpoint, *runner_args, expert=Expert() if amp else None)
                 with patch.object(runner, "log") as log:
                     runner.learn(1)
                     metrics = log.call_args.args[0]
@@ -67,7 +70,7 @@ def main():
         results["environment_hooks_100_steps_s"] = statistics.median(times)
         # Profile CPU scalar extraction as an observable proxy, not CUDA syncs.
         torch.manual_seed(7)
-        runner = Runner(TensorEnvironment(), configuration(False, 100), checkpoint, CONTRACT)
+        runner = Runner(TensorEnvironment(), configuration(False, 100), checkpoint, *runner_args)
         with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as profiler:
             runner.learn(1, optimize=False)
         results["cpu_scalar_extractions_collection_iteration"] = sum(

@@ -111,6 +111,9 @@ class NativeRegressionTests(unittest.TestCase):
         self.assertEqual(len(env.student_reward_functions), 13)
         self.assertFalse(hasattr(env, "previous_hand_box_pos"))
         self.assertEqual(env.student_body_indices, dict(pelvis=0))
+        env.dof_names = list(reversed(env.dof_names))
+        with patch.object(type(env).__mro__[1], "_init_buffers"), self.assertRaisesRegex(ValueError, "joint ordering"):
+            env._init_buffers()
 
     def test_all_configuration_values_and_inherited_teacher_config_unchanged(self):
         from test_mixed_handoff import MixedHandoffCfg, config_namespace

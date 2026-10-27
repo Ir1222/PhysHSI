@@ -50,12 +50,11 @@ The intended external Teacher checkpoint is:
 /home/han/pyx/PhysHSI-carrybox/legged_gym/logs/minimal_carrybox/Oct25_19-58-13_loco_pickup_hold_resume/model_17000.pt
 ```
 
-Teacher loading uses the existing audited `load_actor()` path: semantic
-`scope1_contract` validation, ELU architecture, `eval()`, `requires_grad_(False)`
-and `torch.no_grad()` during inference. Legacy checkpoints require the existing
-explicit `--allow_legacy_contract` source-audit opt-in. Teacher weights are hashed,
-excluded from Adam, and compared exactly against a snapshot after every collection
-iteration, including iterations without optimization.
+Teacher loading accepts native PhysHSI `model_state_dict` checkpoints directly,
+checks the exact ELU Actor architecture and finite weights, and enforces `eval()`
+and `requires_grad_(False)`. Inference uses `torch.no_grad()`. Teacher parameters
+are excluded from Adam. Frozen mode/grad checks run every iteration; exact weight
+snapshot checks run at completion and on every iteration in opt-in debug mode.
 
 Fresh Student initialization defaults to this same Teacher checkpoint, or uses
 `--student_init_checkpoint`. Only its Actor and compatible positive finite
@@ -203,7 +202,8 @@ and weighted reward contributions preserve the Scope 2 calibration diagnostics.
 `mixed_handoff_student_v1` stores ActorCritic/std, discriminator, Adam, optional
 normalizer moments, collection/update/Adam counters, configuration, Teacher
 SHA256/path, initialization provenance, expert SHA256/weights/timing, the 738/126/29
-and 540/54/10 training contract, and the original `scope1_contract`.
+and 540/54/10 training contract, plus runtime timestep/joint-order metadata.
+Old Student exports with optional `scope1_contract` remain readable.
 `play_mixed_handoff.py` can load its Actor directly; no conversion is required.
 
 Full resume rejects Teacher checkpoints, incompatible contracts, changed Teacher
@@ -276,7 +276,7 @@ python tests/audit_carrywith_amp.py
 
 # A: Frozen Teacher / real handoff collection, no optimization, no expert needed.
 python legged_gym/legged_gym/scripts/train_mixed_handoff.py \
-  --teacher_checkpoint "$TEACHER" --allow_legacy_contract \
+  --teacher_checkpoint "$TEACHER" \
   --num_envs 4 --steps_per_env 100 --max_iterations 30 \
   --headless --seed 1 --rl_device cuda:0 --collect_only --no_amp \
   --log_dir legged_gym/logs/mixed_handoff_student/scope3_smoke_a
@@ -284,7 +284,7 @@ python legged_gym/legged_gym/scripts/train_mixed_handoff.py \
 # B: Student PPO only; stop after one nonempty PPO rollout update.
 python legged_gym/legged_gym/scripts/train_mixed_handoff.py \
   --teacher_checkpoint "$TEACHER" --student_init_checkpoint "$TEACHER" \
-  --allow_legacy_contract --num_envs 4 --steps_per_env 100 \
+  --num_envs 4 --steps_per_env 100 \
   --max_iterations 30 --max_optimizer_updates 1 --headless \
   --seed 1 --rl_device cuda:0 --no_amp \
   --log_dir legged_gym/logs/mixed_handoff_student/scope3_smoke_b
@@ -292,7 +292,6 @@ python legged_gym/legged_gym/scripts/train_mixed_handoff.py \
 # C / fresh training: Student PPO + masked CarryWith AMP, at most three updates.
 python legged_gym/legged_gym/scripts/train_mixed_handoff.py \
   --teacher_checkpoint "$TEACHER" --student_init_checkpoint "$TEACHER" \
-  --allow_legacy_contract \
   --num_envs 4 --steps_per_env 100 --max_iterations 30 \
   --max_optimizer_updates 3 --headless --seed 1 --rl_device cuda:0 \
   --log_dir "$RUN"
@@ -300,7 +299,7 @@ python legged_gym/legged_gym/scripts/train_mixed_handoff.py \
 # Find the final saved collection checkpoint, then resume for one further update.
 STUDENT=$(python -c 'import pathlib,sys; print(max(pathlib.Path(sys.argv[1]).glob("model_*.pt"), key=lambda p:int(p.stem.split("_")[-1])))' "$RUN")
 python legged_gym/legged_gym/scripts/train_mixed_handoff.py \
-  --teacher_checkpoint "$TEACHER" --allow_legacy_contract \
+  --teacher_checkpoint "$TEACHER" \
   --num_envs 4 --steps_per_env 100 \
   --max_iterations 30 --max_optimizer_updates 1 --headless --seed 1 \
   --rl_device cuda:0 --resume --resume_path "$STUDENT" \
@@ -309,7 +308,7 @@ python legged_gym/legged_gym/scripts/train_mixed_handoff.py \
 # Existing Viewer: load the saved Student Actor directly.
 python legged_gym/legged_gym/scripts/play_mixed_handoff.py \
   --teacher_checkpoint "$TEACHER" --student_checkpoint "$STUDENT" \
-  --allow_legacy_contract --num_envs 1 --steps 1500 --seed 1 \
+  --num_envs 1 --steps 1500 --seed 1 \
   --rl_device cuda:0 --csv "${RUN}/viewer.csv"
 
 tensorboard --logdir legged_gym/logs/mixed_handoff_student
@@ -334,6 +333,6 @@ Student learning. Their numerical contributions will be reported by the new
 training logs; physical contribution values cannot be claimed from these CPU
 fixtures. Reward/contact calibration should be a separate change after smoke
 diagnostics. No additional domain randomization or curriculum was enabled.
-The training profile uses 16 environments, 60 s episodes and `test=False`, keeps
-default pre-pickup resets, and inherits existing box/robot randomization with
+The current training profile uses 4096 environments, 20 s episodes and `test=False`,
+with PickUp-only RSI resets, and inherits existing box/robot randomization with
 disturbance, delay and pushes disabled, exactly as in the mixed Viewer profile.

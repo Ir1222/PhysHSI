@@ -12,7 +12,7 @@ from test_student_carry import fixture, quat, raw_reward
 from test_mixed_handoff import MATH, STUDENT_CONTROL
 from handoff_regression_support import regression_environment, apply_sample
 from test_mixed_handoff_training import (
-    TensorEnvironment, MixedHandoffOnPolicyRunner, actor_critic, configuration, CONTRACT, Expert,
+    TensorEnvironment, MixedHandoffOnPolicyRunner, actor_critic, configuration, Expert,
 )
 
 
@@ -127,9 +127,9 @@ class MinimalRewardTests(unittest.TestCase):
                     contextlib.redirect_stdout(io.StringIO()):
                 path = Path(folder) / "teacher.pt"
                 torch.manual_seed(17)
-                torch.save(dict(model_state_dict=actor_critic().state_dict(), scope1_contract=CONTRACT), path)
+                torch.save(dict(model_state_dict=actor_critic().state_dict()), path)
                 runner = MixedHandoffOnPolicyRunner(RewardEnvironment(), configuration(amp, 18), path,
-                                                    CONTRACT, expert=Expert() if amp else None)
+                                                    expert=Expert() if amp else None)
                 runner.learn(2, max_optimizer_updates=2)
                 self.assertEqual(runner.alg.optimizer_updates, 2)
                 self.assertGreater(runner.student_steps, 0)
@@ -138,7 +138,7 @@ class MinimalRewardTests(unittest.TestCase):
                 checkpoint = Path(folder) / "student.pt"
                 runner.save(checkpoint)
                 from legged_gym.mixed_handoff import load_actor
-                actor, _ = load_actor(checkpoint, CONTRACT)
+                actor, _ = load_actor(checkpoint)
                 for actual, expected in zip(actor.parameters(), runner.alg.actor_critic.actor.parameters()):
                     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 

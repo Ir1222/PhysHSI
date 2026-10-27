@@ -21,10 +21,10 @@ def get_args():
     parser.add_argument("--student_init_checkpoint", help="Fresh Actor/std initialization; defaults to Teacher")
     parser.add_argument("--amp_expert_config")
     parser.add_argument("--amp_motion_root", help="Directory containing the three original carrywith*.pt files")
-    parser.add_argument("--num_envs", type=int, default=16)
+    parser.add_argument("--num_envs", type=int, default=4096)
     parser.add_argument("--steps_per_env", type=int, default=100)
-    parser.add_argument("--max_iterations", type=int, default=20, help="Collection iterations, including Teacher warmup")
-    parser.add_argument("--max_optimizer_updates", type=int, default=5, help="Stop after this many nonempty rollout updates")
+    parser.add_argument("--max_iterations", type=int, default=20000, help="Collection iterations, including Teacher warmup")
+    parser.add_argument("--max_optimizer_updates", type=int, default=None, help="Optional nonempty rollout update limit")
     parser.add_argument("--episode_length_s", type=float, default=None)
     parser.add_argument("--ablation", choices=["A", "B", "C", "D", "historical"],
                         help="Controlled 20s A/B/C/D or historical 60s full-Approach baseline")
@@ -44,8 +44,7 @@ def get_args():
     parser.add_argument("--rl_device", default="cuda:0")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--resume_path")
-    parser.add_argument("--allow_legacy_contract", action="store_true",
-                        help="Same audited legacy Actor semantics opt-in as play_mixed_handoff.py")
+    parser.add_argument("--detailed_handoff_events", action="store_true", help="Opt in to detailed diagnostics and event export")
     parser.add_argument("--no_amp", action="store_true", help="Diagnostic task-reward-only PPO")
     parser.add_argument("--collect_only", action="store_true", help="Teacher/Student rollout, no optimization")
     parser.add_argument("--log_dir")
@@ -60,7 +59,9 @@ def get_args():
     args.sim_device, args.play_dataset = args.rl_device, False
     if args.physics_engine != gymapi.SIM_PHYSX:
         parser.error("Mixed handoff requires PhysX")
-    if min(args.num_envs, args.steps_per_env, args.max_iterations, args.max_optimizer_updates) < 1 or (args.episode_length_s is not None and not 0 < args.episode_length_s < float("inf")):
+    if (min(args.num_envs, args.steps_per_env, args.max_iterations) < 1
+            or (args.max_optimizer_updates is not None and args.max_optimizer_updates < 1)
+            or (args.episode_length_s is not None and not 0 < args.episode_length_s < float("inf"))):
         parser.error("Environment counts, lengths and update limits must be positive")
     if args.resume != bool(args.resume_path) or (args.resume and args.student_init_checkpoint):
         parser.error("Use --resume --resume_path together; fresh --student_init_checkpoint cannot be combined with resume")

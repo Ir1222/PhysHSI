@@ -18,8 +18,8 @@ RSI ablations and delegates runner creation to the same registry.
 statistics on device. Per-metric reduction still uses float32 and the running
 accumulator uses float64 to reproduce Python-double accumulation. Statistics
 and distributions transfer at iteration boundaries. Sparse event IDs index
-only selected rows/fields before transfer. Set
-`runner.detailed_handoff_events=True` in config for full physical snapshots.
+only selected rows/fields before transfer in explicit debug mode. Set
+`--detailed_handoff_events` for physical snapshots and TensorBoard histograms.
 Control-flow checks and sparse event transfers still synchronize: this change
 does not claim zero GPU synchronization. CUDA timing boundaries are explicit;
 `Perf/gpu_peak_memory_bytes` records per-iteration peak allocated memory on the
@@ -202,9 +202,9 @@ python -m unittest discover -s tests -v
 
 # Small collection, then PPO-only, then PPO+AMP. Original external Teacher
 # is source-audited legacy data: opt in explicitly, never bypass silently.
-python legged_gym/legged_gym/scripts/train.py --task carrybox_mixed_handoff --headless --allow_legacy_contract --num_envs 4 --seed 1 --steps_per_env 100 --max_iterations 2 --collect_only --no_amp --run_name collect_smoke
-python legged_gym/legged_gym/scripts/train.py --task carrybox_mixed_handoff --headless --allow_legacy_contract --num_envs 4 --seed 1 --max_iterations 5 --max_optimizer_updates 5 --no_amp --run_name ppo_smoke
-python legged_gym/legged_gym/scripts/train.py --task carrybox_mixed_handoff --headless --allow_legacy_contract --num_envs 4 --seed 1 --max_iterations 5 --max_optimizer_updates 5 --run_name amp_smoke
+python legged_gym/legged_gym/scripts/train.py --task carrybox_mixed_handoff --headless --num_envs 4 --seed 1 --steps_per_env 100 --max_iterations 2 --collect_only --no_amp --run_name collect_smoke
+python legged_gym/legged_gym/scripts/train.py --task carrybox_mixed_handoff --headless --num_envs 4 --seed 1 --max_iterations 5 --max_optimizer_updates 5 --no_amp --run_name ppo_smoke
+python legged_gym/legged_gym/scripts/train.py --task carrybox_mixed_handoff --headless --num_envs 4 --seed 1 --max_iterations 5 --max_optimizer_updates 5 --run_name amp_smoke
 ```
 
 AMP/optimizer counts must actually be nonzero before calling the corresponding
@@ -222,22 +222,103 @@ Full Approach → physical handoff → Student Viewer, from repository root:
 TEACHER=legged_gym/logs/minimal_carrybox/Oct25_19-58-13_loco_pickup_hold_resume/model_17000.pt
 # Set STUDENT to the actual model_5.pt produced by the amp_smoke run.
 STUDENT=legged_gym/logs/mixed_handoff_student/REPLACE_WITH_ACTUAL_RUN/model_5.pt
-python legged_gym/legged_gym/scripts/play_mixed_handoff.py --teacher_checkpoint "$TEACHER" --student_checkpoint "$STUDENT" --allow_legacy_contract --mode mixed --num_envs 1 --steps 1000 --csv logs/minimal_viewer.csv
+python legged_gym/legged_gym/scripts/play_mixed_handoff.py --teacher_checkpoint "$TEACHER" --student_checkpoint "$STUDENT" --mode mixed --num_envs 1 --steps 1000 --csv logs/minimal_viewer.csv
 ```
 
-Ordinary native entrypoint (uses config defaults, currently bounded to 20
-collection iterations / at most 5 nonempty updates):
+Ordinary native entrypoint (4096 environments, 20 s episodes, 100 rollout
+steps/environment, 20000 collection iterations, save every 500 iterations;
+no extra optimizer-update limit):
 
 ```bash
 python legged_gym/legged_gym/scripts/train.py --task carrybox_mixed_handoff --headless
 ```
 
 The default external checkpoint path is in `MixedHandoffCfgPPO.runner`.
-Strict semantic checks remain enabled. If that legacy checkpoint has no
-`scope1_contract`, use the explicit `--allow_legacy_contract` compatibility
-flag after checking the audited joint/feature/action conventions in
-`play_mixed_handoff.py:actor_contract`. Never infer semantic compatibility
-from shapes alone. A new Student checkpoint saved by this path embeds the
-contract and loads with the existing Viewer Actor loader. Full resume still
-requires the same Teacher hash, AMP source, reward/environment and optimizer
-settings; fresh Actor initialization is separate from full resume.
+Native PhysHSI `model_state_dict` checkpoints load directly without extra
+metadata. Actor loading validates the exact ELU network, keys/shapes and finite
+weights. Teacher is frozen and evaluated without gradients. Fresh Student
+initialization copies Actor/std only; Critic, Adam and 540D AMP are initialized
+independently. The Viewer reads both new and old Student checkpoints.
+Full resume still requires matching network, algorithm/optimizer configuration,
+AMP configuration, Teacher hash, expert identity, environment/reward settings,
+runtime timestep and joint order. New checkpoints store `environment_signature`;
+old optional `scope1_contract` runtime fields are accepted. Simulator state is
+not restored; resume starts new Teacher episodes with empty Student AMP history.
+
+## Production cleanup and metric scopes
+
+Training defaults now match native CarryBox scale and duration. PickUp-only RSI,
+0.1 s training gate, zero forced Stand, Mixed Commands and slew limits retain
+their previous values. Viewer defaults remain 1 environment, full Approach,
+60 s episodes, 0.3 s gate and 0.5 s Stand. Domain randomization, termination,
+all 13 Student reward terms/coefficients, PPO loss/Adam/adaptive KL behavior,
+Student-only GAE, timeout bootstrap and ten-frame 540D AMP validity are unchanged.
+The original `carrybox` task still dispatches to `HIMOnPolicyRunner`.
+
+| Scalar | Scope and denominator |
+|---|---|
+| `student_valid_ratio` | Current rollout Student transitions / all rollout transitions |
+| `student_step_fraction` | Cumulative Student steps / cumulative environment steps; restored on resume |
+| `episode_student_fraction` | Mean of Student / (Teacher + Student) steps for episodes ending in this rollout; includes Teacher-only episodes as zero |
+| `episode_student_fraction_count` | Number of completed episodes used for that mean; zero means no samples |
+| `amp_valid_fraction` | Current rollout AMP-valid / Student-valid steps |
+| `cumulative_amp_valid_fraction` | Cumulative AMP-valid steps / cumulative Student steps |
+| `handoff_success_rate` | Cumulative successful gates / (successful gates + Teacher episodes ending before handoff) |
+| `student/segment_duration_s` | Mean duration of Student segments ending in this rollout, failures and timeouts together |
+| `student/completed_survival_s` | Mean observed physical-failure Student duration |
+| `student/censored_timeout_s` | Mean timeout-censored Student duration; failure takes precedence on overlap |
+| `student/*/count` | Sample count for each of the three duration metrics |
+| `student_incomplete_segments`, `student_incomplete_mean_frames` | Current active Student segments; excluded from ended-segment/survival means |
+| `kl` | Existing PPO mean minibatch KL used by adaptive scheduling, emitted only on actual updates |
+| `learning_rate` | Actual current optimizer learning rate after adaptive scheduling |
+
+Episode counters survive rollout boundaries and clear only for the environments
+that reset. Duration distributions report `median` (p50) and `p90` under
+`distribution/student/...`; the old `performance/student/...` means remain.
+Absent duration means and zero counts indicate no completed observations, not
+zero survival. A zero Student denominator yields ratio zero with explicit
+`student_valid_count`/`student_steps` available. Quantiles are descriptive
+ended-segment summaries, not a censoring-corrected survival estimator.
+
+All scalars go to TensorBoard and `training_metrics.jsonl` every iteration.
+Terminal output stays on its 100-iteration/final cadence and includes real KL,
+learning rate and Student ratios. Detailed event files, physical snapshots and
+TensorBoard histograms require `--detailed_handoff_events`. Production skips
+step-level event CPU export. Exact frozen-weight comparison runs at completion
+(and every debug iteration); frozen mode/gradient checks still run every iteration.
+The runner reuses PPO's counts, avoids a duplicate AMP sample materialization,
+removes redundant clones and skips duplicate final checkpoint writes.
+
+From the repository root in the project's Ubuntu Isaac Gym environment:
+
+```bash
+# Short, explicitly bounded PPO + AMP smoke; configured Teacher and expert must exist.
+python legged_gym/legged_gym/scripts/train.py --task carrybox_mixed_handoff --headless --num_envs 16 --seed 1 --steps_per_env 100 --max_iterations 30 --max_optimizer_updates 3 --run_name cleanup_smoke
+
+# Formal training: no additional optimizer-update limit.
+python legged_gym/legged_gym/scripts/train.py --task carrybox_mixed_handoff --headless
+
+# Full resume: replace the path with the checkpoint produced by a matching run.
+python legged_gym/legged_gym/scripts/train.py --task carrybox_mixed_handoff --headless --resume --resume_path /absolute/path/to/model_500.pt
+```
+
+The smoke's collection bound can be reached without three updates if too few
+episodes pass the unchanged physical gate. Check nonzero PPO/AMP counts rather
+than weakening gate or termination conditions. CPU tests use synthetic physics
+fixtures and actual networks, losses, optimizer, expert data and TensorBoard;
+they do not establish Isaac Gym/CUDA training throughput or success rates.
+
+Validation on 2026-10-27: `python -m unittest discover -s tests -v` passed all
+99 CPU tests (the unchanged pre-edit baseline passed 94). Coverage includes
+native checkpoint loading, frozen Teacher and fresh Student Actor/std/critic/Adam,
+exact rollout/GAE/PPO/AMP/weight agreement with the historical Runner, unlimited
+updates beyond five, native registry dispatch/defaults/CLI overrides, asynchronous
+episode ratios including zero-Student episodes, survival censoring, actual
+TensorBoard/JSON round trips, Viewer loading and old/new full resume checks.
+`git diff --check` passed. Original CarryBox source/config, ActorCritic, PPO,
+Storage, AMP discriminator and 540D projection files have no changes.
+This Windows host has PyTorch 2.6.0+cpu, no CUDA/Isaac Gym, and no configured
+`model_17000.pt`; checkpoint regressions use native-format tensor fixtures.
+Ubuntu GPU smoke/formal training and the real external Teacher remain unverified
+by this cleanup. The previously supplied Ubuntu training results are not a new
+validation run of this commit.

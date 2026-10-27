@@ -227,14 +227,14 @@ TEACHER=/home/han/pyx/PhysHSI-carrybox/legged_gym/logs/minimal_carrybox/Oct25_19
 # Same checkpoint in both roles: regression/smoke test, not learned locomotion.
 python legged_gym/legged_gym/scripts/play_mixed_handoff.py \
   --teacher_checkpoint "$TEACHER" --student_checkpoint "$TEACHER" \
-  --allow_legacy_contract --mode stand --num_envs 1 --steps 1000 \
+  --mode stand --num_envs 1 --steps 1000 \
   --csv logs/handoff_scope2_stand.csv
 
 # With an audited mixed-velocity Actor:
 STUDENT=/absolute/path/to/mixed_velocity/model_19999.pt
 python legged_gym/legged_gym/scripts/play_mixed_handoff.py \
   --teacher_checkpoint "$TEACHER" --student_checkpoint "$STUDENT" \
-  --allow_legacy_contract --mode mixed --num_envs 1 --steps 1500 \
+  --mode mixed --num_envs 1 --steps 1500 \
   --csv logs/handoff_scope2_mixed.csv
 ```
 

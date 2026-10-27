@@ -14,27 +14,30 @@ from unittest.mock import Mock, patch
 import torch
 
 from test_mixed_handoff_training import (
-    ROOT, CONTRACT, Expert, TensorEnvironment, actor_critic, configuration,
+    ROOT, Expert, TensorEnvironment, actor_critic, configuration,
     MixedHandoffOnPolicyRunner,
 )
 
 
 class RefactorTests(unittest.TestCase):
-    def test_event_export_is_sparse_and_verbose_snapshots_are_opt_in(self):
+    def test_event_export_is_sparse_and_opt_in(self):
         with tempfile.TemporaryDirectory() as folder, contextlib.redirect_stdout(io.StringIO()):
             root = Path(folder)
             path = root / "teacher.pt"
-            torch.save(dict(model_state_dict=actor_critic().state_dict(), scope1_contract=CONTRACT), path)
+            torch.save(dict(model_state_dict=actor_critic().state_dict()), path)
             with patch("torch.utils.tensorboard.SummaryWriter"):
                 runner = MixedHandoffOnPolicyRunner(TensorEnvironment(), configuration(False, 4), path,
-                                                    CONTRACT, log_dir=root / "log")
+                                                    log_dir=root / "log")
             runner.reset()
-            for _ in range(4):
+            runner.collect_step()
+            self.assertFalse((root / "log/handoff_events.jsonl").exists())
+            runner.detailed_diagnostics = True
+            for _ in range(3):
                 runner.collect_step()
             events = [json.loads(line) for line in (root / "log/handoff_events.jsonl").read_text().splitlines()]
             self.assertEqual([row["env_id"] for row in events], [0, 1])
             self.assertTrue(all(row["handoff_trigger"] for row in events))
-            self.assertNotIn("student/linear_error", events[0])
+            self.assertIn("student/linear_error", events[0])
             self.assertEqual(events[0]["student/termination_reason"], 0)
             runner.writer.close()
 
@@ -43,17 +46,23 @@ class RefactorTests(unittest.TestCase):
             "git", "show", "6beaf95:rsl_rl/rsl_rl/runners/mixed_handoff_on_policy_runner.py"], cwd=ROOT).decode()
         baseline = {"__name__": "baseline_runner"}
         exec(compile(source, "baseline_runner.py", "exec"), baseline)
+        from legged_gym.mixed_handoff import load_actor
+        baseline["load_actor"] = lambda path, contract, device, legacy: load_actor(path, device)
         torch.set_num_threads(1)
         with tempfile.TemporaryDirectory() as folder, contextlib.redirect_stdout(io.StringIO()):
             path = Path(folder) / "teacher.pt"
             torch.manual_seed(7)
-            torch.save(dict(model_state_dict=actor_critic().state_dict(), scope1_contract=CONTRACT), path)
+            torch.save(dict(model_state_dict=actor_critic().state_dict()), path)
             results = []
             for cls in (baseline["MixedHandoffOnPolicyRunner"], MixedHandoffOnPolicyRunner):
                 torch.manual_seed(123)
-                runner = cls(TensorEnvironment(), configuration(True, 36), path, CONTRACT, expert=Expert())
+                args = ({},) if cls is baseline["MixedHandoffOnPolicyRunner"] else ()
+                runner = cls(TensorEnvironment(), configuration(True, 36), path, *args, expert=Expert())
                 runner.reset()
                 samples = [{k: v.clone() for k, v in runner.collect_step().items()} for _ in range(36)]
+                for sample in samples:
+                    sample.pop("episode_student_fraction", None)
+                    sample.pop("student/segment_duration_s", None)
                 rollout = copy.deepcopy(runner.storage.data)
                 runner.storage.compute_returns(runner.alg.gamma, runner.alg.lam)
                 returns = runner.storage.data["returns"].clone()

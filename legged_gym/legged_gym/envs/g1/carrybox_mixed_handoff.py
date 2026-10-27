@@ -58,6 +58,13 @@ class MixedHandoff(LeggedRobot):
         super()._init_buffers()
         if (self.num_obs, self.num_privileged_obs, self.num_actions) != (738, 126, 29):
             raise ValueError("Mixed handoff requires the PhysHSI 738/126/29 contract")
+        # This is a simulator invariant, independent of checkpoint metadata.
+        from pathlib import Path
+        from legged_gym import LEGGED_GYM_ROOT_DIR
+        mapping = Path(LEGGED_GYM_ROOT_DIR) / "resources/config/joint_id.txt"
+        canonical = [line.split()[1] for line in mapping.read_text().splitlines() if line.strip()]
+        if list(self.dof_names) != canonical or len(canonical) != 29:
+            raise ValueError("Simulator joint ordering differs from the G1 29-DOF mapping")
         settings = HandoffSettings(
             **{k: getattr(self.cfg.handoff, k) for k in HandoffSettings.__dataclass_fields__}
         )
