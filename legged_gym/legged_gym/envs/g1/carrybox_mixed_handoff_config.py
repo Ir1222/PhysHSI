@@ -189,6 +189,7 @@ class MixedHandoffCfgPPO(G1CfgPPO):
         num_steps_per_env = 100
         max_iterations = 20  # collection iterations, including Teacher warmup
         max_optimizer_updates = 5
+        terminal_log_interval = 100
         save_interval = 500
         experiment_name = "mixed_handoff_student"
         run_name = "scope3"

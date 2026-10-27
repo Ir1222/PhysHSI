@@ -1,7 +1,9 @@
 """Frozen Teacher collection with independently optimized Student PPO + AMP."""
 import hashlib
 import json
+import math
 from pathlib import Path
+import time
 
 import torch
 
@@ -56,6 +58,10 @@ class MixedHandoffOnPolicyRunner:
         self.env, self.train_cfg, self.contract = env, train_cfg, contract
         self.device, self.log_dir = torch.device(device), Path(log_dir) if log_dir else None
         self.cfg, amp_cfg = train_cfg["runner"], train_cfg["amp"]
+        self.terminal_log_interval = self.cfg.get("terminal_log_interval", 100)
+        if (isinstance(self.terminal_log_interval, bool)
+                or not isinstance(self.terminal_log_interval, int) or self.terminal_log_interval < 1):
+            raise ValueError("terminal_log_interval must be a positive integer")
         if not 0 <= amp_cfg["amp_coef"] <= 1 or amp_cfg["reward_scale"] < 0:
             raise ValueError("AMP reward requires 0 <= amp_coef <= 1 and nonnegative reward_scale")
         self.teacher, teacher_spec = load_actor(teacher_checkpoint, contract, device, allow_legacy_contract)
@@ -226,12 +232,58 @@ class MixedHandoffOnPolicyRunner:
         if any(not torch.equal(p, self.teacher_snapshot[k]) for k, p in self.teacher.state_dict().items()):
             raise RuntimeError("Frozen Teacher weights changed")
 
+    def _synchronize_timing(self):
+        # perf_counter alone measures CUDA dispatch, not completed GPU work.
+        devices = {torch.device(self.device), torch.device(self.env.device)}
+        for device in devices:
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+
+    def log(self, metrics, total_iterations, elapsed_time, eta, final=False, width=80, pad=35):
+        """Compact native PhysHSI panel; detailed metrics stay in file/TensorBoard."""
+        def number(value, spec=".4f", suffix=""):
+            if value is None or not math.isfinite(value):
+                return "N/A"
+            return f"{value:{spec}}{suffix}"
+
+        def row(label, value):
+            return f"{label + ':':>{pad}} {value}"
+
+        title = f" Learning/Collection iteration {self.collection_iteration}/{total_iterations}"
+        title += " (final) " if final else " "
+        lines = ["#" * width, title.center(width), "",
+                 row("Computation", number(metrics.get("Perf/total_fps"), ".0f", " steps/s")),
+                 row("Collection time", number(metrics.get("Perf/collection_time"), ".3f", "s")),
+                 row("Learning time", number(metrics.get("Perf/learning_time"), ".3f", "s")),
+                 row("Value function loss", number(metrics.get("value"))),
+                 row("Surrogate loss", number(metrics.get("surrogate"))),
+                 row("Mean action noise std", number(metrics.get("Policy/mean_noise_std"), ".2f")),
+                 row("Learning rate", number(metrics.get("learning_rate"), ".2e")),
+                 row("Mean Student task reward", number(metrics.get("performance/task_reward"))),
+                 row("Mean AMP reward", number(metrics.get("performance/amp_reward_valid"))),
+                 row("Student-valid ratio", number(metrics.get("student_valid_ratio"), ".2%")),
+                 row("AMP-valid fraction", number(metrics.get("amp_valid_fraction")
+                                                 if metrics.get("student_valid_count", 0) else None, ".2%")),
+                 row("Handoff success rate", number(metrics.get("handoff_success_rate")
+                                                  if self.handoff_successes + self.handoff_failures else None, ".2%")),
+                 row("Mean completed Student survival", number(metrics.get("performance/student/completed_survival_s"), ".3f", "s")),
+                 row("Actual PPO optimizer updates", str(self.alg.optimizer_updates)),
+                 "-" * width,
+                 row("Total timesteps", str(self.teacher_steps + self.student_steps)),
+                 row("Total time (this run)", number(elapsed_time, ".2f", "s")),
+                 row("ETA (collection limit)", number(eta, ".1f", "s"))]
+        print("\n".join(lines), flush=True)
+
     def learn(self, iterations, optimize=True, max_optimizer_updates=None):
         if self.obs is None:
             self.reset()
         start_updates = self.alg.optimizer_updates
+        total_iterations = self.collection_iteration + iterations
+        run_start = time.perf_counter()
         try:
-            for _ in range(iterations):
+            for completed in range(1, iterations + 1):
+                self._synchronize_timing()
+                collection_start = time.perf_counter()
                 stats = {}
                 distributions = {}
                 for _ in range(self.cfg["num_steps_per_env"]):
@@ -246,12 +298,17 @@ class MixedHandoffOnPolicyRunner:
                                 distributions.setdefault(k, []).append(v.detach().float().cpu())
                 count = int(self.storage.data["student_valid"][:self.storage.step].sum())
                 amp_count = len(self.storage.amp_samples())
+                self._synchronize_timing()
+                learning_start = time.perf_counter()
+                collection_time = learning_start - collection_start
                 self.storage.compute_returns(self.alg.gamma, self.alg.lam)
                 if optimize:
                     metrics = self.alg.update(self.storage)
                 else:
                     self.storage.clear()
                     metrics = dict(student_valid_count=count, amp_valid_count=amp_count, updated=0)
+                self._synchronize_timing()
+                learning_time = time.perf_counter() - learning_start
                 self.assert_teacher_frozen()
                 self.collection_iteration += 1
                 attempts = self.handoff_successes + self.handoff_failures
@@ -279,14 +336,28 @@ class MixedHandoffOnPolicyRunner:
                         metrics["distribution/" + k + "/" + label] = float(torch.quantile(values, q))
                     if self.writer:
                         self.writer.add_histogram("distribution/" + k, values, self.collection_iteration)
+                elapsed_time = time.perf_counter() - run_start
+                reached_limit = (max_optimizer_updates is not None
+                                 and self.alg.optimizer_updates-start_updates >= max_optimizer_updates)
+                final = completed == iterations or reached_limit
+                eta = 0. if final else elapsed_time / completed * (iterations - completed)
+                metrics.update({"Perf/collection_time": collection_time, "Perf/learning_time": learning_time,
+                                "Perf/total_fps": self.env.num_envs * self.cfg["num_steps_per_env"] /
+                                                  max(collection_time + learning_time, 1e-9),
+                                "Policy/mean_noise_std": self.alg.actor_critic.std.detach().mean().item(),
+                                "learning_rate": self.alg.learning_rate})
                 if self.writer:
                     for k, v in metrics.items():
                         self.writer.add_scalar(k, v, self.collection_iteration)
                     self.writer.flush()
-                print(json.dumps(metrics, sort_keys=True), flush=True)
+                if self.log_dir:
+                    with (self.log_dir / "training_metrics.jsonl").open("a", encoding="utf-8") as stream:
+                        stream.write(json.dumps(metrics, sort_keys=True) + "\n")
+                if self.collection_iteration % self.terminal_log_interval == 0 or final:
+                    self.log(metrics, total_iterations, elapsed_time, eta, final=final)
                 if self.log_dir and self.collection_iteration % self.cfg["save_interval"] == 0:
                     self.save(self.log_dir / f"model_{self.collection_iteration}.pt")
-                if max_optimizer_updates is not None and self.alg.optimizer_updates-start_updates >= max_optimizer_updates:
+                if reached_limit:
                     break
             if self.log_dir:
                 self.save(self.log_dir / f"model_{self.collection_iteration}.pt")

@@ -550,6 +550,8 @@ class TrainingRegressionTests(unittest.TestCase):
         self.assertEqual(viewer.handoff.stable_duration_s, .3)
         self.assertEqual(viewer.handoff.student_initial_stand_duration_s, .5)
         self.assertEqual(ns["MixedHandoffCfgPPO"]().runner.num_steps_per_env, 100)
+        self.assertEqual(ns["MixedHandoffCfgPPO"]().runner.terminal_log_interval, 100)
+        self.assertEqual(ns["MixedHandoffCfgPPO"]().runner.save_interval, 500)
         for group in ("student_rewards", "student_termination", "control", "sim", "domain_rand", "dataset"):
             def values(obj):
                 return {k: values(getattr(obj, k)) if hasattr(getattr(obj, k), "__dict__") else getattr(obj, k)

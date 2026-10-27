@@ -227,7 +227,7 @@ class EfficiencyConfigTests(unittest.TestCase):
             self.assertTrue(any(e["handoff_trigger"] for e in events))
             self.assertEqual(runner.episode_student_steps.tolist(), [0., 0.])
             self.assertEqual(runner.alg.optimizer_updates, 0)
-            metrics = [json.loads(line) for line in output.getvalue().splitlines() if line.startswith("{")][-1]
+            metrics = json.loads((Path(folder) / "training_metrics.jsonl").read_text().splitlines()[-1])
             self.assertAlmostEqual(metrics["performance/episode/teacher_steps"], 3.)
             self.assertAlmostEqual(metrics["performance/student/completed_survival_s"], .28)
             self.assertAlmostEqual(metrics["performance/student/censored_timeout_s"], .28)
@@ -239,9 +239,9 @@ class EfficiencyConfigTests(unittest.TestCase):
             output = io.StringIO()
             with contextlib.redirect_stdout(output):
                 incomplete = MixedHandoffOnPolicyRunner(TensorEnvironment(), configuration(amp=False, steps=10),
-                                                        checkpoint, CONTRACT)
+                                                        checkpoint, CONTRACT, log_dir=Path(folder) / "incomplete")
                 incomplete.learn(1, optimize=False)
-            metrics = [json.loads(line) for line in output.getvalue().splitlines() if line.startswith("{")][-1]
+            metrics = json.loads((Path(folder) / "incomplete/training_metrics.jsonl").read_text().splitlines()[-1])
             self.assertEqual(metrics["student_incomplete_segments"], 2)
             self.assertEqual(metrics["student_incomplete_mean_frames"], 7.)
             self.assertNotIn("performance/student/completed_survival_s", metrics)
