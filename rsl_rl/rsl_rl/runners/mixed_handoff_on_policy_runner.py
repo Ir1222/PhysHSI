@@ -102,6 +102,10 @@ class MixedHandoffOnPolicyRunner:
         self.episode_teacher_steps = torch.zeros(env.num_envs, device=self.device)
         self.episode_student_steps = torch.zeros_like(self.episode_teacher_steps)
         self.episode_amp_steps = torch.zeros_like(self.episode_teacher_steps)
+        # TensorBoard-only episode returns; never enter PPO or JSON diagnostics.
+        self._tb_episode_returns = torch.zeros(env.num_envs, 3, device=self.device)
+        self._tb_completed = []
+        self._tb_episode_info = []
 
     def reset(self):
         obs, critic = self.env.reset()
@@ -110,6 +114,7 @@ class MixedHandoffOnPolicyRunner:
         self.episode_teacher_steps.zero_()
         self.episode_student_steps.zero_()
         self.episode_amp_steps.zero_()
+        self._tb_episode_returns.zero_()
 
     @torch.no_grad()
     def collect_step(self):
@@ -201,6 +206,14 @@ class MixedHandoffOnPolicyRunner:
             "termination/teacher_physical_failure": (failures & ~student)[dones].float(),
             "termination/episode_timeout": timeouts[dones].float(),
         })
+        if self.writer:
+            self._tb_episode_returns += torch.where(
+                student[:, None], torch.stack((reward, task_reward, amp_reward), dim=1), 0.)
+            self._tb_completed.append(torch.cat((self._tb_episode_returns[segments],
+                self.episode_student_steps[segments, None], self.episode_amp_steps[segments, None]), dim=1))
+            self._tb_episode_returns[dones] = 0
+            if "episode" in infos:
+                self._tb_episode_info.append(infos["episode"])
         self.episode_teacher_steps[dones] = 0
         self.episode_student_steps[dones] = 0
         self.episode_amp_steps[dones] = 0
@@ -319,6 +332,8 @@ class MixedHandoffOnPolicyRunner:
                 collection_start = time.perf_counter()
                 stats = {}
                 distributions = {}
+                self._tb_completed.clear()
+                self._tb_episode_info.clear()
                 for _ in range(self.cfg["num_steps_per_env"]):
                     for k, v in self.collect_step().items():
                         if v.numel():
@@ -384,8 +399,6 @@ class MixedHandoffOnPolicyRunner:
                     metrics["distribution/" + k + "/count"] = values.numel()
                     for label, q in (("min", 0.), ("p10", .1), ("median", .5), ("p90", .9), ("max", 1.)):
                         metrics["distribution/" + k + "/" + label] = float(torch.quantile(values, q))
-                    if self.writer and self.detailed_diagnostics:
-                        self.writer.add_histogram("distribution/" + k, values, self.collection_iteration)
                 elapsed_time = time.perf_counter() - run_start
                 reached_limit = (max_optimizer_updates is not None
                                  and self.alg.optimizer_updates-start_updates >= max_optimizer_updates)
@@ -399,8 +412,55 @@ class MixedHandoffOnPolicyRunner:
                                 "Policy/mean_noise_std": self.alg.actor_critic.std.detach().mean().item(),
                                 "learning_rate": self.alg.learning_rate})
                 if self.writer:
-                    for k, v in metrics.items():
-                        self.writer.add_scalar(k, v, self.collection_iteration)
+                    # Fixed native-style whitelist. Full diagnostics stay in JSONL.
+                    scalars = {
+                        "Loss/value_function": metrics.get("value"),
+                        "Loss/surrogate": metrics.get("surrogate"),
+                        "Loss/learning_rate": metrics["learning_rate"],
+                        "Loss/amp_expert_loss": metrics.get("amp_expert_loss"),
+                        "Loss/amp_policy_loss": metrics.get("amp_policy_loss"),
+                        "Train/student_ratio": metrics["student_valid_ratio"],
+                        "Train/handoff_success_rate": metrics["handoff_success_rate"] if attempts else None,
+                        # Observed failure endpoints only; censored timeouts stay in JSONL.
+                        "Train/student_survival_s": metrics.get("student/completed_survival_s"),
+                        "Policy/mean_noise_std": metrics["Policy/mean_noise_std"],
+                        "Perf/total_fps": metrics["Perf/total_fps"],
+                        "Perf/collection_time": metrics["Perf/collection_time"],
+                        "Perf/learning_time": metrics["Perf/learning_time"],
+                    }
+                    if "amp_gradient_penalty" in metrics:
+                        scalars["Loss/amp_loss"] = (metrics["amp_expert_loss"] +
+                            metrics["amp_policy_loss"] + metrics["amp_gradient_penalty"])
+                    ended = torch.cat(self._tb_completed)
+                    if ended.numel():
+                        # Same completed Student cohort, including timeouts, across
+                        # rollout boundaries. Length is Student frames, not Teacher warmup.
+                        combined, raw, amp, length, amp_frames = ended.mean(0).cpu().tolist()
+                        scalars.update({"Train/mean_reward": combined, "Train/mean_raw_reward": raw,
+                                        "Train/mean_episode_length": length})
+                        # Masked history frames contribute zero to the AMP return.
+                        # No AMP-valid observations (or disabled AMP) means no curve.
+                        if self.alg.amp is not None and amp_frames > 0:
+                            scalars["Train/mean_amp_reward"] = amp
+                    for name in ("carry_lin_vel_tracking", "carry_yaw_vel_tracking", "carry_bilateral_contact",
+                                 "lin_vel_z", "ang_vel_xy", "orientation", "dof_acc", "action_rate", "torques",
+                                 "dof_vel", "dof_pos_limits", "dof_vel_limits", "torque_limits"):
+                        key = "student/mean_step_reward/" + name
+                        # Weight reset-batch means by completed Student episode count;
+                        # exclude Teacher-only episodes. Match Policy1's per-second rew_*.
+                        entries = [torch.stack((torch.as_tensor(info[key], device=self.device),
+                                    torch.as_tensor(info["student/episodes_with_student"], device=self.device)))
+                                   for info in self._tb_episode_info
+                                   if key in info and "student/episodes_with_student" in info]
+                        if entries:
+                            entries = torch.stack(entries)
+                            total, episodes = torch.stack(((entries[:, 0] * entries[:, 1]).sum(),
+                                                            entries[:, 1].sum())).cpu().tolist()
+                            if episodes > 0:
+                                scalars["Episode/rew_" + name] = total / episodes / getattr(self.env, "dt", .02)
+                    for tag, value in scalars.items():
+                        if value is not None and math.isfinite(value):
+                            self.writer.add_scalar(tag, value, self.collection_iteration)
                     self.writer.flush()
                 if self.log_dir:
                     with (self.log_dir / "training_metrics.jsonl").open("a", encoding="utf-8") as stream:
