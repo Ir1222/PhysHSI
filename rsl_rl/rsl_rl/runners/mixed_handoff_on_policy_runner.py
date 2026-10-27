@@ -86,6 +86,7 @@ class MixedHandoffOnPolicyRunner:
         self.teacher_steps = self.student_steps = 0
         self.amp_steps = 0
         self.handoff_successes = self.handoff_failures = 0
+        self._pending_counts = torch.zeros(5, dtype=torch.long, device=self.device)
         self.writer = None
         if self.log_dir:
             from torch.utils.tensorboard import SummaryWriter
@@ -159,13 +160,10 @@ class MixedHandoffOnPolicyRunner:
                          student_valid=student, next_student=next_student, amp_valid=amp_valid,
                          amp_observations=amp_obs)
         self.obs, self.critic_obs = obs, critic
-        self.teacher_steps += int((~student).sum())
-        self.student_steps += int(student.sum())
-        self.amp_steps += int(amp_valid.sum())
         trigger = diag["handoff_trigger"].to(self.device).bool()
         failed = diag["handoff_failure"].to(self.device).bool()
-        self.handoff_successes += int(trigger.sum())
-        self.handoff_failures += int(failed.sum())
+        self._pending_counts += torch.stack(((~student).sum(), student.sum(), amp_valid.sum(),
+                                            trigger.sum(), failed.sum()))
         samples = dict(task_reward=task_reward[student], amp_reward=amp_reward[student], combined_reward=reward[student],
                        amp_reward_valid=amp_reward[amp_valid] if enabled else amp_reward[:0],
                        handoff_time=diag["handoff_time"].to(self.device)[trigger])
@@ -207,14 +205,24 @@ class MixedHandoffOnPolicyRunner:
                 mask = first if key.startswith(("student_first", "action_discontinuity")) else trigger
                 samples["gate/" + key] = diag[key].to(self.device)[mask].float().flatten()
         if self.log_dir:
-            events = (trigger | first | dones).nonzero().flatten().tolist()
-            if events:
-                rows = {k: v.detach().cpu().tolist() for k, v in diag.items()}
+            event_ids = (trigger | first | dones).nonzero().flatten()
+            if event_ids.numel():
+                # Index on the source GPU before copying; production records
+                # contain only ownership, contact and terminal information.
+                fields = ("executed_phase", "executed_command", "handoff_trigger", "first_student_step",
+                          "handoff_time", "failure", "timeout", "box_height", "hand_contact",
+                          "student/termination_reason")
+                selected = diag if self.cfg.get("detailed_handoff_events", False) else {
+                    k: diag[k] for k in fields if k in diag}
+                rows = {k: v.detach().index_select(0, event_ids.to(v.device)).cpu().tolist()
+                        for k, v in selected.items()}
+                events = event_ids.cpu().tolist()
+                first_rows = first[event_ids].cpu().tolist()
                 with (self.log_dir / "handoff_events.jsonl").open("a", encoding="utf-8") as stream:
-                    for index in events:
-                        event = {k: values[index] for k, values in rows.items()}
+                    for row, index in enumerate(events):
+                        event = {k: values[row] for k, values in rows.items()}
                         event.update(collection_iteration=self.collection_iteration, env_id=index)
-                        if not bool(first[index]):
+                        if not first_rows[row]:
                             for key in ("student_first_action", "action_discontinuity", "action_discontinuity_l2"):
                                 event.pop(key, None)
                         stream.write(json.dumps(event) + "\n")
@@ -225,6 +233,13 @@ class MixedHandoffOnPolicyRunner:
         for bit, name in ((1, "box_drop"), (2, "separation"), (4, "grasp_loss"), (8, "tilt"), (16, "physical"), (32, "timeout")):
             samples["termination/" + name] = ((reasons[student & dones] & bit) != 0).float()
         return samples
+
+    def _flush_counts(self):
+        counts = self._pending_counts.cpu().tolist()
+        for name, count in zip(("teacher_steps", "student_steps", "amp_steps",
+                                "handoff_successes", "handoff_failures"), counts):
+            setattr(self, name, getattr(self, name) + count)
+        self._pending_counts.zero_()
 
     def assert_teacher_frozen(self):
         if self.teacher.training or any(p.requires_grad or p.grad is not None for p in self.teacher.parameters()):
@@ -283,19 +298,25 @@ class MixedHandoffOnPolicyRunner:
         try:
             for completed in range(1, iterations + 1):
                 self._synchronize_timing()
+                if self.device.type == "cuda":
+                    torch.cuda.reset_peak_memory_stats(self.device)
                 collection_start = time.perf_counter()
                 stats = {}
                 distributions = {}
                 for _ in range(self.cfg["num_steps_per_env"]):
                     for k, v in self.collect_step().items():
                         if v.numel():
-                            sums = stats.setdefault(k, [0., 0., 0])
-                            sums[0] += v.sum().item()
-                            sums[1] += v.square().sum().item()
-                            sums[2] += v.numel()
+                            # Float64 accumulation matches the former Python
+                            # double accumulator; reductions remain float32.
+                            reduced = torch.stack((v.sum(), v.square().sum())).double()
+                            if k not in stats:
+                                stats[k] = [reduced, v.numel()]
+                            else:
+                                stats[k][0] += reduced
+                                stats[k][1] += v.numel()
                             if k in ("handoff_time", "episode/teacher_steps", "episode/teacher_warmup_s",
                                      "student/segment_frames", "student/completed_survival_s", "student/censored_timeout_s"):
-                                distributions.setdefault(k, []).append(v.detach().float().cpu())
+                                distributions.setdefault(k, []).append(v.detach().float())
                 count = int(self.storage.data["student_valid"][:self.storage.step].sum())
                 amp_count = len(self.storage.amp_samples())
                 self._synchronize_timing()
@@ -310,6 +331,7 @@ class MixedHandoffOnPolicyRunner:
                 self._synchronize_timing()
                 learning_time = time.perf_counter() - learning_start
                 self.assert_teacher_frozen()
+                self._flush_counts()
                 self.collection_iteration += 1
                 attempts = self.handoff_successes + self.handoff_failures
                 metrics.update(collection_iterations=self.collection_iteration, optimizer_updates=self.alg.optimizer_updates,
@@ -325,12 +347,13 @@ class MixedHandoffOnPolicyRunner:
                                student_incomplete_mean_frames=float(self.episode_student_steps[active].mean()) if active.any() else 0.,
                                teacher_incomplete_episodes=int((self.env.handoff.phase != STUDENT_CONTROL).sum()),
                                pending_first_student_segments=int(((self.env.handoff.phase == STUDENT_CONTROL) & ~active).sum()))
-                for k, (total, square, number) in stats.items():
+                reduced_stats = torch.stack([s[0] for s in stats.values()]).cpu().tolist() if stats else []
+                for (k, (_, number)), (total, square) in zip(stats.items(), reduced_stats):
                     metrics["performance/" + k] = total / number
                     if "reward" in k:
                         metrics["performance/" + k + "_std"] = max(0., square / number - (total / number)**2)**.5
                 for k, batches in distributions.items():
-                    values = torch.cat(batches)
+                    values = torch.cat(batches).cpu()
                     metrics["distribution/" + k + "/count"] = values.numel()
                     for label, q in (("min", 0.), ("p10", .1), ("median", .5), ("p90", .9), ("max", 1.)):
                         metrics["distribution/" + k + "/" + label] = float(torch.quantile(values, q))
@@ -342,6 +365,8 @@ class MixedHandoffOnPolicyRunner:
                 final = completed == iterations or reached_limit
                 eta = 0. if final else elapsed_time / completed * (iterations - completed)
                 metrics.update({"Perf/collection_time": collection_time, "Perf/learning_time": learning_time,
+                                "Perf/gpu_peak_memory_bytes": torch.cuda.max_memory_allocated(self.device)
+                                if self.device.type == "cuda" else 0,
                                 "Perf/total_fps": self.env.num_envs * self.cfg["num_steps_per_env"] /
                                                   max(collection_time + learning_time, 1e-9),
                                 "Policy/mean_noise_std": self.alg.actor_critic.std.detach().mean().item(),
@@ -366,6 +391,7 @@ class MixedHandoffOnPolicyRunner:
                 self.writer.close()
 
     def save(self, path):
+        self._flush_counts()
         normalizer = self.alg.amp_normalizer
         torch.save(dict(format="mixed_handoff_student_v1", scope1_contract=self.contract,
                         training_contract=TRAINING_CONTRACT, train_cfg=self.train_cfg,
@@ -428,6 +454,7 @@ class MixedHandoffOnPolicyRunner:
         for k in ("teacher_steps", "student_steps", "handoff_successes", "handoff_failures"):
             setattr(self, k, checkpoint[k])
         self.amp_steps = checkpoint.get("amp_steps", 0)  # Compatible with Scope 3 exports.
+        self._pending_counts.zero_()
         # Simulator state is not restored: resume begins a real Teacher episode.
         self.obs = self.critic_obs = None
         self.history.count.zero_()

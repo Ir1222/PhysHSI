@@ -560,7 +560,7 @@ class TrainingRegressionTests(unittest.TestCase):
         registry = (ROOT / "legged_gym/legged_gym/utils/task_registry.py").read_text()
         self.assertIn("runner = HIMOnPolicyRunner", registry)
         script = (ROOT / "legged_gym/legged_gym/scripts/train_mixed_handoff.py").read_text()
-        self.assertIn("runner = MixedHandoffOnPolicyRunner", script)
+        self.assertIn("task_registry.make_alg_runner", script)
 
 
 if __name__ == "__main__":

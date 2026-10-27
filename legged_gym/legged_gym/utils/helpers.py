@@ -204,6 +204,13 @@ def get_args():
         {"name": "--seed", "type": int, "help": "Random seed. Overrides config file if provided."},
         {"name": "--max_iterations", "type": int, "help": "Maximum number of training iterations. Overrides config file if provided."},
         {"name": "--play_dataset", "action": "store_true", "default": False, "help": "Visualize the reference."},
+        {"name": "--teacher_checkpoint", "type": str, "help": "Mixed handoff frozen Teacher override"},
+        {"name": "--student_init_checkpoint", "type": str, "help": "Mixed handoff fresh Actor/std override"},
+        {"name": "--allow_legacy_contract", "action": "store_true", "help": "Explicit source-audited legacy Actor opt-in"},
+        {"name": "--collect_only", "action": "store_true", "help": "Mixed handoff collection without optimization"},
+        {"name": "--no_amp", "action": "store_true", "help": "Mixed handoff PPO-only diagnostic"},
+        {"name": "--steps_per_env", "type": int, "help": "Mixed handoff rollout length override"},
+        {"name": "--max_optimizer_updates", "type": int, "help": "Mixed handoff nonempty update limit override"},
     ]
     # parse arguments
     args = gymutil.parse_arguments(
@@ -426,5 +433,3 @@ class Return_Onnx(torch.nn.Module):
             output_names=["estvalues"],
             dynamic_axes={},
         )
-        
-    

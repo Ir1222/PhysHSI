@@ -87,7 +87,8 @@ def actor_contract(env):
 
 
 def play(args):
-    cfg, _ = task_registry.get_cfgs("carrybox_mixed_handoff")
+    from legged_gym.envs.g1.carrybox_mixed_handoff_config import MixedHandoffCfg
+    cfg = MixedHandoffCfg()  # Viewer retains full Approach and its original gate.
     cfg.env.episode_length_s = args.episode_length_s
     cfg.handoff.height = args.handoff_height
     for name in ("stable_duration_s", "student_initial_stand_duration_s", "mode",

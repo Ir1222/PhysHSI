@@ -40,7 +40,12 @@ import torch
 def train(args, headless=False):
     env, env_cfg = task_registry.make_env(name=args.task, args=args)
     ppo_runner, train_cfg = task_registry.make_alg_runner(env=env, name=args.task, args=args)
-    ppo_runner.learn(num_learning_iterations=train_cfg.runner.max_iterations, init_at_random_ep_len=True)
+    if getattr(train_cfg, "runner_class_name", None) == "MixedHandoffOnPolicyRunner":
+        ppo_runner.learn(train_cfg.runner.max_iterations,
+                         optimize=not train_cfg.runner.collect_only,
+                         max_optimizer_updates=train_cfg.runner.max_optimizer_updates)
+    else:
+        ppo_runner.learn(num_learning_iterations=train_cfg.runner.max_iterations, init_at_random_ep_len=True)
 
 if __name__ == '__main__':
     args = get_args()

@@ -1,4 +1,4 @@
-"""Short, explicit Student PPO + 540D AMP training; original train.py is untouched."""
+"""Compatibility/debug CLI using the native task registry and shared training runner."""
 import argparse
 import json
 from datetime import datetime
@@ -11,10 +11,8 @@ from isaacgym import gymapi, gymutil
 from legged_gym import LEGGED_GYM_ROOT_DIR
 from legged_gym.envs import *
 from legged_gym.envs.g1.carrybox_mixed_handoff_config import MixedHandoffCfg, MixedHandoffTrainingCfg, MixedHandoffCfgPPO
-from legged_gym.envs.motionlib.motionlib_carrywith import CarryWithMotionLib, validate_carrywith_config
-from legged_gym.scripts.play_mixed_handoff import actor_contract
+from legged_gym.envs.motionlib.motionlib_carrywith import validate_carrywith_config
 from legged_gym.utils import task_registry, class_to_dict
-from rsl_rl.runners.mixed_handoff_on_policy_runner import MixedHandoffOnPolicyRunner
 
 
 def get_args():
@@ -129,22 +127,13 @@ def train(args):
         validate_carrywith_config(expert_config, args.amp_motion_root)  # Fail before allocating PhysX.
     env, _ = task_registry.make_env("carrybox_mixed_handoff", args=args, env_cfg=env_cfg)
     try:
-        expert = None
-        if train_cfg.amp.enabled:
-            expert = CarryWithMotionLib(expert_config,
-                                       env_cfg.dataset.joint_mapping_file.format(LEGGED_GYM_ROOT_DIR=LEGGED_GYM_ROOT_DIR),
-                                       env.dof_names, env_cfg.dataset.frame_rate, args.rl_device,
-                                       env.dt, env_cfg.rewards.thresh_robot2object, args.amp_motion_root)
-        cfg = class_to_dict(train_cfg)
-        cfg["environment"] = class_to_dict(env_cfg)
-        log_dir = args.log_dir or str(Path(LEGGED_GYM_ROOT_DIR) / "logs" / train_cfg.runner.experiment_name /
-                                     datetime.now().strftime("%b%d_%H-%M-%S_scope3"))
-        # Explicit isolated runner selection; registry's original HIM dispatch is unchanged.
-        runner = MixedHandoffOnPolicyRunner(env, cfg, args.teacher_checkpoint, actor_contract(env),
-                                            args.student_init_checkpoint, expert, log_dir, args.rl_device,
-                                            args.allow_legacy_contract, initialize=not args.resume)
-        if args.resume:
-            runner.load(args.resume_path)
+        # The compatibility CLI keeps ablations; runner/expert construction is
+        # shared with train.py through the native registry.
+        for name in ("experiment_name", "run_name", "load_run", "checkpoint"):
+            if not hasattr(args, name):
+                setattr(args, name, None)
+        runner, train_cfg = task_registry.make_alg_runner(
+            env, args=args, train_cfg=train_cfg)
         runner.learn(args.max_iterations, optimize=not args.collect_only,
                      max_optimizer_updates=args.max_optimizer_updates)
     finally:

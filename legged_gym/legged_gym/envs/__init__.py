@@ -40,6 +40,6 @@ from .g1.carrybox_config import G1CfgPPO as G1CarryBoxCfgPPO
 task_registry.register( "carrybox", G1CarryBox, G1CarryBoxCfg(), G1CarryBoxCfgPPO() )
 
 from .g1.carrybox_mixed_handoff import MixedHandoff
-from .g1.carrybox_mixed_handoff_config import MixedHandoffCfg
+from .g1.carrybox_mixed_handoff_config import MixedHandoffTrainingCfg, MixedHandoffCfgPPO
 
-task_registry.register("carrybox_mixed_handoff", MixedHandoff, MixedHandoffCfg(), G1CarryBoxCfgPPO())
+task_registry.register("carrybox_mixed_handoff", MixedHandoff, MixedHandoffTrainingCfg(), MixedHandoffCfgPPO())

@@ -193,6 +193,11 @@ class MixedHandoffCfgPPO(G1CfgPPO):
         save_interval = 500
         experiment_name = "mixed_handoff_student"
         run_name = "scope3"
+        teacher_checkpoint = "{LEGGED_GYM_ROOT_DIR}/logs/minimal_carrybox/Oct25_19-58-13_loco_pickup_hold_resume/model_17000.pt"
+        student_init_checkpoint = None  # Same pretrained Actor/std as Teacher.
+        allow_legacy_contract = False
+        collect_only = False
+        detailed_handoff_events = False
 
     class amp:
         enabled = True
