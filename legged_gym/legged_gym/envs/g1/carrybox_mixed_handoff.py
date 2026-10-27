@@ -1,6 +1,7 @@
 """Continuous handoff with separate Teacher and Student carry objectives."""
 
 import math
+import json
 
 import torch
 from isaacgym.torch_utils import quat_rotate_inverse
@@ -8,6 +9,7 @@ from isaacgym.torch_utils import quat_rotate_inverse
 from .carrybox import LeggedRobot
 from .carrybox_mixed_handoff_config import MixedHandoffCfg
 from legged_gym.mixed_handoff import HandoffSettings, HandoffState, STUDENT_CONTROL
+from legged_gym.pickup_rsi import sample_pickup_time, pickup_box_velocity
 from legged_gym.utils.helpers import class_to_dict
 from legged_gym.utils.torch_utils import calc_heading_quat, quat_conjugate, quat_mul
 
@@ -45,6 +47,47 @@ def rotation_vector(q):
 
 
 class MixedHandoff(LeggedRobot):
+    def reset(self):
+        # BaseTask.reset performs one zero-action physics step to refresh obs.
+        # In training it cannot count as an actual frozen-Teacher action.
+        self._initializing_training_observations = hasattr(self.cfg, "pickup_rsi")
+        try:
+            return super().reset()
+        finally:
+            self._initializing_training_observations = False
+
+    def _reset_ref_state_init(self, env_ids):
+        settings = getattr(self.cfg, "pickup_rsi", None)
+        if settings is None or not settings.enabled:
+            return super()._reset_ref_state_init(env_ids)
+        if list(self.skill) != ["pickUp"] or list(self.box_cfg.skill_init_prob) != [1.0]:
+            raise ValueError("Training PickUp RSI requires pickUp-only skill/probability")
+        # Retain the native reset bookkeeping consumed by _reset_boxes,
+        # _reset_task and _reset_env_tensors. Only sampling and reference
+        # velocities differ; do not perturb a contact pose with joint noise.
+        ids = self.motionlib.sample_motions("pickUp", len(env_ids))
+        times = sample_pickup_time(self.motionlib, ids, settings)
+        pos, rot, lin, ang, joints, velocities, _ = self.motionlib.get_motion_state("pickUp", ids, times)
+        self.root_states[env_ids, :3] = pos + self.env_origins[env_ids]
+        self.root_states[env_ids, 3:7] = rot
+        self.root_states[env_ids, 7:10] = lin
+        self.root_states[env_ids, 10:13] = ang
+        self.dof_pos[env_ids] = joints
+        self.dof_vel[env_ids] = velocities
+        self._reset_ref_env_ids["pickUp"] = env_ids
+        self._reset_ref_motion_ids["pickUp"] = ids
+        self._reset_ref_motion_times["pickUp"] = times
+
+    def _reset_boxes(self, env_ids):
+        super()._reset_boxes(env_ids)
+        settings = getattr(self.cfg, "pickup_rsi", None)
+        if settings is not None and settings.enabled and "pickUp" in self._reset_ref_env_ids:
+            ids = self._reset_ref_env_ids["pickUp"]
+            linear, angular = pickup_box_velocity(self.motionlib, self._reset_ref_motion_ids["pickUp"],
+                                                  self._reset_ref_motion_times["pickUp"])
+            self.box_states[ids, 7:10] = linear
+            self.box_states[ids, 10:13] = angular
+
     def _init_buffers(self):
         super()._init_buffers()
         if (self.num_obs, self.num_privileged_obs, self.num_actions) != (738, 126, 29):
@@ -259,7 +302,7 @@ class MixedHandoff(LeggedRobot):
             self.box_states[:, 2],
             contact.all(-1),
             clearance,
-            self.reset_buf,
+            self.reset_buf | getattr(self, "_initializing_training_observations", False),
             self.episode_length_buf * self.dt,
         )
         torso = self.rigid_body_states[:, self.torso_index]
@@ -293,6 +336,10 @@ class MixedHandoff(LeggedRobot):
             "hand_force": forces,
             "hand_surface_distance": surface_distance,
             "base_velocity": torch.cat((base_linear[:, :2], base_angular[:, 2:3]), -1),
+            "base_linear_velocity": base_linear,
+            "base_angular_velocity": base_angular,
+            "box_linear_velocity": self.box_states[:, 7:10],
+            "box_angular_velocity": self.box_states[:, 10:13],
             "base_xy_speed": self.root_states[:, 7:9].norm(dim=-1),
             "box_angular_speed": self.box_states[:, 10:13].norm(dim=-1),
             "box_torso_relative_velocity": self.box_states[:, 7:10] - torso[:, 7:10],
@@ -406,6 +453,18 @@ class MixedHandoff(LeggedRobot):
             # Ordinary episode resets only; never called on a handoff.
             self.obs_buf[env_ids] = 0
             self.actions[env_ids] = 0
+            settings = getattr(self.cfg, "pickup_rsi", None)
+            if settings is not None and settings.enabled and settings.log_resets:
+                ids = self._reset_ref_env_ids.get("pickUp", env_ids[:0])
+                print(json.dumps(dict(event="pickup_rsi_reset", env_ids=ids.cpu().tolist(),
+                                      motion_ids=self._reset_ref_motion_ids.get("pickUp", ids).cpu().tolist(),
+                                      motion_frames=self._reset_ref_motion_times.get("pickUp", ids).cpu().tolist(),
+                                      root=self.root_states[ids].cpu().tolist(),
+                                      dof_pos=self.dof_pos[ids].cpu().tolist(),
+                                      dof_vel=self.dof_vel[ids].cpu().tolist(),
+                                      box=self.box_states[ids].cpu().tolist(),
+                                      platform=self.platform_pos[ids].cpu().tolist(),
+                                      phase=self.handoff.phase[ids].cpu().tolist())), flush=True)
 
     def _update_student_carry_state(self):
         """Sample once after physics, before termination/rewards/reset. Never moves physics."""

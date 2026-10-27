@@ -529,7 +529,7 @@ class TrainingRegressionTests(unittest.TestCase):
                 with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                     self.parse(base + options)
 
-    def test_training_profile_preserves_viewer_gate_rewards_commands_and_default_reset(self):
+    def test_training_profile_preserves_viewer_rewards_commands_and_separate_reset(self):
         ns = dict(config_namespace)
         classes_from_source(ROOT / "legged_gym/legged_gym/envs/g1/carrybox_config.py", ["G1CfgPPO"], ns)
         classes_from_source(ROOT / "legged_gym/legged_gym/envs/g1/carrybox_mixed_handoff_config.py",
@@ -540,8 +540,17 @@ class TrainingRegressionTests(unittest.TestCase):
         self.assertFalse(training.env.test)
         self.assertEqual(viewer.env.num_envs, 1)
         self.assertTrue(viewer.env.test)
-        self.assertEqual(training.asset.box.reset_mode, "default")
-        for group in ("handoff", "student_rewards", "student_termination", "control", "sim", "domain_rand", "dataset"):
+        self.assertEqual(training.asset.box.reset_mode, "random")
+        self.assertEqual(training.asset.box.skill, ["pickUp"])
+        self.assertEqual(training.asset.box.skill_init_prob, [1.])
+        self.assertEqual(training.env.episode_length_s, 20.)
+        self.assertEqual(training.handoff.stable_duration_s, .1)
+        self.assertEqual(training.handoff.student_initial_stand_duration_s, 0.)
+        self.assertEqual(viewer.asset.box.reset_mode, "default")
+        self.assertEqual(viewer.handoff.stable_duration_s, .3)
+        self.assertEqual(viewer.handoff.student_initial_stand_duration_s, .5)
+        self.assertEqual(ns["MixedHandoffCfgPPO"]().runner.num_steps_per_env, 100)
+        for group in ("student_rewards", "student_termination", "control", "sim", "domain_rand", "dataset"):
             def values(obj):
                 return {k: values(getattr(obj, k)) if hasattr(getattr(obj, k), "__dict__") else getattr(obj, k)
                         for k in dir(obj) if not k.startswith("_")}

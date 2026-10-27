@@ -151,14 +151,27 @@ class MixedHandoffCfg(G1Cfg):
 
 
 class MixedHandoffTrainingCfg(MixedHandoffCfg):
-    """Conservative training profile; Viewer and original carrybox stay unchanged."""
+    """Candidate D; Viewer and original carrybox retain full Approach resets."""
     class env(MixedHandoffCfg.env):
         num_envs = 16
-        episode_length_s = 60
+        episode_length_s = 20.0
         test = False
 
-    # Inherit the existing randomization settings; add no new randomization.
-    # reset_mode remains default: every episode starts before Teacher pickup.
+    class asset(MixedHandoffCfg.asset):
+        class box(MixedHandoffCfg.asset.box):
+            reset_mode = "random"
+            skill = ["pickUp"]
+            skill_init_prob = [1.0]
+
+    class pickup_rsi:
+        enabled = True
+        window = "contact"  # "full" delegates to the original full-clip sampler.
+        contact_window_s = (-0.2, 0.2)
+        log_resets = False
+
+    class handoff(MixedHandoffCfg.handoff):
+        stable_duration_s = 0.1
+        student_initial_stand_duration_s = 0.0
 
 
 class MixedHandoffCfgPPO(G1CfgPPO):

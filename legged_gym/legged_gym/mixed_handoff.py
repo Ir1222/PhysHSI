@@ -93,7 +93,10 @@ class HandoffState:
         self.handoff_time[switched] = episode_time[switched]
         self.student_time[student] += self.dt
         self.resample_time[student] -= self.dt
-        active = (student & ~done & (self.student_time + 1e-7
+        # With no forced stand, schedule at the gate, for the next Actor obs.
+        # The just-executed action/reward still belongs to Teacher.
+        command_student = student | (switched & (self.settings.student_initial_stand_duration_s == 0))
+        active = (command_student & ~done & (self.student_time + 1e-7
                   >= self.settings.student_initial_stand_duration_s))
         due = (active & (self.resample_time <= 0)).nonzero().flatten()
         if len(due):

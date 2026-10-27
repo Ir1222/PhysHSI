@@ -38,6 +38,10 @@ class NativeRegressionTests(unittest.TestCase):
                     env.student_reward_names, env.student_reward_functions)}
                 actual = snapshot(env, raw, env.student_carry_metrics, env.student_steps,
                                   env.student_total_sum, env.student_episode_sums)
+                # New vector diagnostics are additive. Compare every frozen
+                # Scope 2 key/value exactly as before; do not refresh the golden.
+                for key in ("base_linear_velocity", "base_angular_velocity", "box_linear_velocity", "box_angular_velocity"):
+                    actual["diagnostics"].pop(key)
                 self.assert_snapshot(actual, expected)
                 env.last_actions.copy_(env.actions)
                 env.last_dof_vel.copy_(env.dof_vel)
