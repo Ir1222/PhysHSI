@@ -139,7 +139,6 @@ class OwnershipTests(unittest.TestCase):
         env = fixture()
         env.student_steps[:] = torch.tensor([2., 0.])
         env.student_total_sum[:] = torch.tensor([4., 0.])
-        env.student_history_valid[:] = True
         env.last_box_contacts[:] = True
         env.grasp_loss_time[:] = .2
         env.student_episode_sums["action_rate"][:] = torch.tensor([-.2, 0.])
@@ -154,7 +153,6 @@ class OwnershipTests(unittest.TestCase):
         self.assertEqual(episode["student/episodes_without_student"], 1.)
         self.assertEqual(episode["student/episodes_with_student"], 1.)
         self.assertAlmostEqual(episode["student/mean_step_reward/action_rate"].item(), -.1)
-        self.assertFalse(env.student_history_valid.any())
         self.assertFalse(env.last_box_contacts.any())
         self.assertEqual(env.grasp_loss_time.sum(), 0.)
         self.assertEqual(env.student_steps.sum(), 0.)
@@ -196,22 +194,8 @@ class CoordinateTests(unittest.TestCase):
         full_local = MATH.quat_rotate_inverse(env.rigid_body_states[:, 0, 3:7], env.rigid_body_states[:, 0, 7:10])
         self.assertFalse(torch.allclose(full_local[:, :2], env.student_carry_metrics["measured_velocity_yaw"]))
 
-    def test_zero_stillness_and_lateral_yaw_air_time(self):
-        env = fixture()
-        env.feet_air_time[:] = 1.
-        env.first_contacts[:] = True
-        update(env)
-        torch.testing.assert_close(raw_reward(env, "zero_command_stillness"), torch.ones(2))
-        self.assertEqual(raw_reward(env, "feet_air_time").sum(), 0.)
-        env.executed_command[0, 1] = .2
-        env.executed_command[1, 2] = .2
-        update(env)
-        self.assertTrue(env.student_carry_metrics["moving_command"].all())
-        self.assertTrue((raw_reward(env, "feet_air_time") > 0).all())
-        self.assertEqual(raw_reward(env, "zero_command_stillness").sum(), 0.)
 
-
-class ContactPostureTests(unittest.TestCase):
+class ContactTests(unittest.TestCase):
     def test_bilateral_filter_and_force_attribution(self):
         env = fixture()
         update(env)
@@ -226,77 +210,6 @@ class ContactPostureTests(unittest.TestCase):
         update(env, surface_distance=torch.ones(2, 2), box_bottom=torch.ones(2))
         self.assertFalse(env.student_carry_metrics["filtered_box_contact"].any())
         self.assertTrue(env.student_carry_metrics["raw_hand_contact"][1].all())
-
-    def test_random_box_faces_and_surface_violation(self):
-        env = fixture()
-        env._box_size[:] = torch.tensor([[.3, .4, .2], [.4, .6, .3]])
-        env.rigid_body_states[:, 7, :3] = env.box_states[:, :3]
-        env.rigid_body_states[:, 8, :3] = env.box_states[:, :3]
-        env.rigid_body_states[:, 7, 1] += env._box_size[:, 1]/2
-        env.rigid_body_states[:, 8, 1] -= env._box_size[:, 1]/2
-        update(env)
-        torch.testing.assert_close(raw_reward(env, "carry_hand_box_surface"), torch.ones(2))
-        env.rigid_body_states[0, 7, 1] += .2
-        update(env)
-        self.assertLess(raw_reward(env, "carry_hand_box_surface")[0], 1.)
-        self.assertEqual(raw_reward(env, "carry_hand_box_surface")[1], 1.)
-
-    def test_first_student_derivative_invalid_then_real_torso_frame_motion(self):
-        env = fixture()
-        env.executed_phase[:] = STUDENT_CONTROL
-        env.rigid_body_states[:, 6, 3:7] = quat(yaw=math.pi/2)
-        update(env)
-        self.assertFalse(env.student_carry_metrics["derivative_valid"].any())
-        self.assertEqual(env.student_carry_metrics["hand_slip"].abs().sum(), 0.)
-        self.assertEqual(raw_reward(env, "carry_relative_velocity").sum(), 0.)
-        env.box_states[:, 1] += .02
-        update(env)
-        torch.testing.assert_close(env.student_carry_metrics["box_relative_velocity"][:, 0], torch.ones(2), atol=1e-5, rtol=0)
-        env._reset_student_carry_buffers([0])
-        update(env)
-        self.assertEqual(env.student_carry_metrics["derivative_valid"].tolist(), [False, True])
-        self.assertEqual(env.student_carry_metrics["box_relative_velocity"][0].abs().sum(), 0.)
-
-    def test_slip_excludes_box_normal_motion_and_penalizes_tangent_motion(self):
-        env = fixture()
-        env.executed_phase[:] = STUDENT_CONTROL
-        update(env)
-        update(env)
-        torch.testing.assert_close(raw_reward(env, "carry_hand_slip"), torch.ones(2))
-        env.rigid_body_states[:, [7, 8], 1] += .1  # Box Y is face normal.
-        update(env)
-        torch.testing.assert_close(env.student_carry_metrics["hand_slip"], torch.zeros(2, 2))
-        env.rigid_body_states[0, [7, 8], 0] += .1
-        update(env)
-        self.assertLess(raw_reward(env, "carry_hand_slip")[0], 1.)
-        self.assertEqual(raw_reward(env, "carry_hand_slip")[1], 1.)
-
-    def test_feasible_regions_and_joint_order(self):
-        env = fixture()
-        env.dof_pos[:, env.carry_waist_indices] = torch.tensor(env.cfg.student_rewards.carry_waist_reference_target)
-        env.rigid_body_states[:, 6, 3:7] = torch.tensor(env.cfg.student_rewards.carry_torso_pelvis_reference_quat)
-        env.rigid_body_states[:, 1, 1] = .1
-        env.rigid_body_states[:, 2, 1] = -.1
-        env.rigid_body_states[:, 3, 1] = .1
-        env.rigid_body_states[:, 4, 1] = -.1
-        update(env)
-        for name in ("carry_hip_posture", "carry_waist_reference", "carry_torso_pelvis_alignment",
-                     "carry_feet_width", "carry_knee_width", "carry_foot_heading"):
-            torch.testing.assert_close(raw_reward(env, name), torch.ones(2))
-        previous_obs = env.obs_buf.clone()
-        env.dof_pos[0, env.carry_hip_indices] += 1.
-        env.dof_pos[0, env.carry_waist_indices] += 1.
-        env.rigid_body_states[0, 1, 1] = 1.
-        update(env)
-        for name in ("carry_hip_posture", "carry_waist_reference", "carry_feet_width"):
-            self.assertLess(raw_reward(env, name)[0], raw_reward(env, name)[1])
-        torch.testing.assert_close(env.obs_buf, previous_obs)
-        for field in ("carry_hip_joint_names", "carry_waist_joint_names"):
-            cfg = MixedHandoffCfg().student_rewards
-            setattr(cfg, field, tuple(reversed(getattr(cfg, field))))
-            with self.assertRaisesRegex(ValueError, "joint order"):
-                env.cfg.student_rewards = cfg
-                env._init_student_carry_buffers()
 
 
 class TerminationTests(unittest.TestCase):
@@ -355,9 +268,9 @@ class TerminationTests(unittest.TestCase):
         self.assertEqual(info["failure"].tolist(), [True, False])
         self.assertTrue(info["timeout"].all())
         self.assertEqual(info["student/termination_reason"].tolist(), [33, 32])
-        before = info["student/box_relative_position"].clone()
+        before = info["box_height"].clone()
         env.box_states[:] = 0.
-        torch.testing.assert_close(info["student/box_relative_position"], before)
+        torch.testing.assert_close(info["box_height"], before)
 
 
 if __name__ == "__main__":

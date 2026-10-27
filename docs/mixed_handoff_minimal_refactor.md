@@ -61,6 +61,138 @@ Run `python tests/benchmark_mixed_handoff.py --output results.json` and add
 `--baseline` to evaluate the audited old Runner. Run serially. Raw local
 outputs are in ignored `logs/refactor_validation/`; no long training was run.
 
+## Commit B: minimal Student objective
+
+The exact Student scales are now:
+
+```python
+class scales:
+    carry_lin_vel_tracking = 3.0
+    carry_yaw_vel_tracking = 2.5
+    carry_bilateral_contact = 0.5
+    lin_vel_z = -1.0
+    ang_vel_xy = -0.05
+    orientation = -1.0
+    dof_acc = -1e-7
+    action_rate = -0.03
+    torques = -1e-4
+    dof_vel = -2e-4
+    dof_pos_limits = -5.0
+    dof_vel_limits = -1e-3
+    torque_limits = -0.03
+```
+
+`carrybox_mixed_handoff_config.py` retains only tracking sigmas (.25/.25)
+outside this list. `_prepare_student_reward_function` copies scales and applies
+control dt once. The seven joint/actuator regularizers are bound directly to
+the original Policy 1 implementations. Three small stability helpers preserve
+the existing explicit body-frame references; tests compare them exactly to
+the original PhysHSI cached-velocity/projected-gravity formulas. Gravity uses
+the existing simulator tensor, with no per-step constant tensor construction.
+
+Deleted active terms and implementations:
+
+```text
+carry_arm_range, carry_hip_posture, carry_foot_heading, carry_feet_width,
+carry_knee_width, carry_waist_reference, carry_torso_pelvis_alignment,
+carry_hand_box_surface, carry_hand_slip, carry_relative_velocity,
+carry_relative_position, carry_box_tilt, zero_command_stillness,
+feet_air_time, feet_slip, feet_stumble, collision, feet_contact_forces
+```
+
+Deleted dependencies: arm/hip/waist joint lists and index buffers, foot/knee
+reward body lists, posture targets/ranges/deadzones/softness, hand-face shaping,
+relative-position/velocity tolerances, previous hand/box-relative positions,
+derivative-valid history, raw-contact history, posture/quaternion helper
+functions, and all unused Student reward cache fields. Inherited simulation
+state used by Teacher observations/rewards/termination remains intact.
+
+Normal `_update_student_carry_state` now computes tracking errors, filtered
+hand-box contact, grasp timer, drop/separation and enabled terminal flags.
+The physical gate already computes palm-to-rotated-box proximity and rotated
+box bottom; contact is passed directly into the Student update. Bilateral
+reward and grasp loss share its one-frame OR filter. **Default numerics are
+unchanged**: force >1N and box-surface distance <.08m. The duplicate Student
+force-threshold setting is removed: an explicit nondefault gate force override
+now intentionally also controls Student contact. This correction is tested
+with a 3N threshold and 2N forces; neither gate nor positive contact reward
+accepts those contacts. The independent .3s complete-grasp-loss grace remains.
+
+Drop height .15m, separation 1m, native failure rules, timeout boundary and
+optional tilt termination remain unchanged. Disabled tilt is not computed for
+normal training; explicit tilt debugging/enabled termination still computes it.
+No URDF, action/torque clipping, PD gain, simulator constraint or Teacher source
+file was changed.
+
+Production reward aggregation has separate Teacher/Student lists and episode
+sums, with ownership from `executed_phase` and `executed_command`. Full per-term
+raw/weighted clones and physical action snapshots require
+`env_cfg.diagnostics.detailed=True`; Viewer `--csv` explicitly enables it.
+For detailed event-file export also set `runner.detailed_handoff_events=True`.
+Normal TensorBoard receives tracking/contact/failure/validity metrics and
+`episode/student/mean_step_reward/<term>` on resets, using Student-step
+denominators; removed posture metrics are not calculated for logging.
+
+The resulting environment data flow is:
+
+```text
+PickUp-only native RSI → frozen Teacher action
+  → physics / native state refresh
+  → physical gate geometry + minimal Student contact/tracking/failure update
+  → native physical failure + independent Student failures / timeout
+  → executed-policy-owned reward (Teacher still owns gate-triggering action)
+  → native AMP observation before reset → ordinary episode reset if needed
+  → next Actor observation with applied rate-limited command
+  → Student-only PPO / segment-bounded GAE / 10-frame-valid 540D AMP
+```
+
+### Numerical and training verification
+
+The original frozen JSON fixture is unchanged. New tests compare all 13 retained
+raw terms and their contributions against that data, then reconstruct the new
+total from **only** the retained contributions. Across seven two-environment
+samples: raw retained max error = 0; weighted retained max error =
+3.725290298461914e-9; Teacher raw/weighted max errors = 0. Ownership, contact
+filter, tracking frames, terminal reasons and Teacher episode sums also match.
+Normal/debug reward totals, contact, failure flags and episode sums agree exactly.
+
+All 94 CPU tests passed. The CPU suite additionally runs real minimal reward computation into two bounded
+PPO-only and PPO+AMP updates, checks a frozen Teacher, and reloads the saved
+Student Actor through the existing Viewer loader. These use synthetic physics
+and synthetic Teacher weights; they do not establish external model_17000.pt
+loading or physical Viewer stability. Five tests for deleted shaping behavior
+were removed; minimal reward/production-path tests replace them. The A Runner
+rollout/GAE/PPO/AMP exact numerical regression is retained.
+
+Measured B CPU fixture results (same benchmark settings as A):
+
+| Metric | Baseline | A | B |
+|---|---:|---:|---:|
+| PPO FPS | 791.98 | 720.62 | 647.67 |
+| PPO collection / learning, s | .19747 / .05353 | .22151 / .05603 | .25419 / .06470 |
+| PPO + AMP FPS | 497.55 | 594.27 | 542.33 |
+| PPO + AMP collection / learning, s | .29644 / .09587 | .25372 / .08712 | .26920 / .10824 |
+| Actual environment hooks, 100 steps, s | 1.13938 | 1.21913 | .49828 |
+| CPU scalar extractions / collection iteration | 4145 | 2039 | 2039 |
+| Student-valid / all samples | .81 | .81 | .81 |
+| AMP-valid / Student samples | .339506 | .339506 | .339506 |
+| Rollout bytes | 1,890,000 | 1,890,000 | 1,890,000 |
+
+Runner timings use synthetic observations/rewards to isolate collection/update
+infrastructure; the separate environment-hooks timing runs actual environment
+reward/termination code. All timings are individual medians, so FPS need not
+equal the reciprocal of the sum of median times. B's hook measurement uses
+normal diagnostics, while baseline/A always executed their full diagnostics.
+This is the intended production-default comparison. Timing variance prevents
+a claim of overall training acceleration. GPU FPS, memory, synchronization and
+physical Student/AMP-valid fractions still require Ubuntu measurements.
+
+Full resume from a pre-B checkpoint rejects the changed Student reward config;
+use a fresh run or explicit Actor/std initialization for a different objective.
+The Teacher checkpoint and its native pickup/hold task remain independent.
+AMP supplies the motion prior; reduced shaping may change contact/stability
+and survival. Short synthetic tests do not predict trained-policy quality.
+
 ## Ubuntu verification commands
 
 From the repository root in the existing Isaac Gym Python environment:

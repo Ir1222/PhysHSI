@@ -54,6 +54,7 @@ def main():
                             "student_valid_ratio", "amp_valid_fraction")}
             results["storage_bytes"] = sum(t.numel()*t.element_size() for t in runner.storage.data.values())
         env = regression_environment()
+        env.detailed_diagnostics = False  # Normal training, no Viewer CSV.
         times = []
         for repeat in range(4):
             start = time.perf_counter()

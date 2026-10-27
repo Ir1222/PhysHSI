@@ -229,6 +229,9 @@ class MixedHandoffOnPolicyRunner:
         for k, v in diag.items():
             if k.startswith(("student/", "student_reward_raw/", "student_reward_weighted/")):
                 samples[k] = v.to(self.device)[student].float().flatten()
+        for key, value in infos.get("episode", {}).items():
+            if key.startswith("student/"):
+                samples["episode/" + key] = torch.as_tensor(value, device=self.device).detach().reshape(-1)
         reasons = diag["student/termination_reason"].to(self.device).long()
         for bit, name in ((1, "box_drop"), (2, "separation"), (4, "grasp_loss"), (8, "tilt"), (16, "physical"), (32, "timeout")):
             samples["termination/" + name] = ((reasons[student & dones] & bit) != 0).float()

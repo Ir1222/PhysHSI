@@ -25,33 +25,49 @@ class NativeRegressionTests(unittest.TestCase):
             torch.testing.assert_close(torch.as_tensor(actual), torch.as_tensor(expected),
                                        atol=0. if exact else 5e-8, rtol=0. if exact else 1e-7, msg=path)
 
-    def test_all_terms_metrics_boundaries_and_episode_statistics_match_scope2(self):
+    def test_retained_terms_teacher_boundaries_and_minimal_totals_match_scope2(self):
         golden = json.loads((Path(__file__).parent / "fixtures/mixed_handoff_scope2.json").read_text())
         self.assertEqual(golden["baseline_commit"], "6295c21694c793ff7f4f2f445f1331eba2313754")
         env = regression_environment()
+        cumulative = torch.zeros(2)
         for step, expected in enumerate(golden["samples"]):
             with self.subTest(step=step):
                 apply_sample(env, step)
                 env.check_termination()
                 env.compute_reward()
-                raw = {name: function() for name, function in zip(
-                    env.student_reward_names, env.student_reward_functions)}
-                actual = snapshot(env, raw, env.student_carry_metrics, env.student_steps,
-                                  env.student_total_sum, env.student_episode_sums)
-                # New vector diagnostics are additive. Compare every frozen
-                # Scope 2 key/value exactly as before; do not refresh the golden.
-                for key in ("base_linear_velocity", "base_angular_velocity", "box_linear_velocity", "box_angular_velocity"):
-                    actual["diagnostics"].pop(key)
-                self.assert_snapshot(actual, expected)
+                diag = env.extras["handoff"]
+                # Frozen golden is not regenerated when changing the objective.
+                # All retained raw terms, Teacher terms and ownership stay fixed.
+                for name, function in zip(env.student_reward_names, env.student_reward_functions):
+                    torch.testing.assert_close(function(), torch.tensor(expected["raw_student"][name]), rtol=0, atol=0)
+                    self.assert_snapshot(diag["student_reward_weighted/" + name].tolist(),
+                        expected["diagnostics"]["student_reward_weighted/" + name])
+                    self.assert_snapshot(env.student_episode_sums[name].tolist(), expected["student_sums"][name])
+                self.assert_snapshot({k: v.tolist() for k, v in env.episode_sums.items()}, expected["teacher_sums"])
+                for key, value in diag.items():
+                    if key.startswith("teacher_reward_") or key in (
+                            "teacher_total_reward", "executed_phase", "executed_command", "handoff_trigger",
+                            "first_student_step", "failure", "timeout", "student/termination_reason",
+                            "student/linear_tracking_error", "student/yaw_tracking_error", "student/bilateral_contact",
+                            "student/grasp_loss_duration", "student/filtered_box_contact"):
+                        self.assert_snapshot(value.tolist(), expected["diagnostics"][key], "snapshot/" + key)
+                minimal = torch.zeros(2)
+                for name in env.student_reward_names:
+                    minimal += torch.tensor(expected["diagnostics"]["student_reward_weighted/" + name])
+                cumulative += minimal
+                torch.testing.assert_close(diag["student_reward_before_clip"], minimal, atol=5e-8, rtol=1e-7)
+                torch.testing.assert_close(env.rew_buf, minimal + torch.tensor(expected["diagnostics"]["teacher_total_reward"]), atol=5e-8, rtol=1e-7)
+                torch.testing.assert_close(env.student_total_sum, cumulative, atol=5e-8, rtol=1e-7)
                 env.last_actions.copy_(env.actions)
                 env.last_dof_vel.copy_(env.dof_vel)
 
+        before_steps = env.student_steps.clone()
         def base_reset(instance, ids):
             instance.extras["episode"] = {}
-
         with patch.object(type(env).__mro__[1], "reset_idx", base_reset):
             env.reset_idx(torch.tensor([0, 1]))
-        self.assert_snapshot({k: v.tolist() for k, v in env.extras["episode"].items()}, golden["episode"])
+        torch.testing.assert_close(env.extras["episode"]["student/mean_step_reward/total"],
+                                   (cumulative / before_steps).mean())
 
     def test_native_preparation_dt_once_disabled_terms_and_teacher_separation(self):
         env = fixture()
@@ -62,14 +78,13 @@ class NativeRegressionTests(unittest.TestCase):
             self.assertEqual(env.student_reward_scales["carry_lin_vel_tracking"], 3.*env.dt)
             self.assertEqual(env.cfg.student_rewards.scales.carry_lin_vel_tracking, 3.)
             self.assertEqual(env.reward_scales, before)
-        env.cfg.student_rewards.scales.carry_hand_slip = 0.
+        env.cfg.student_rewards.scales.carry_bilateral_contact = 0.
         env._prepare_student_reward_function()
-        self.assertNotIn("carry_hand_slip", env.student_reward_names)
-        self.assertNotIn("carry_hand_slip", env.student_episode_sums)
+        self.assertNotIn("carry_bilateral_contact", env.student_reward_names)
+        self.assertNotIn("carry_bilateral_contact", env.student_episode_sums)
         self.assertEqual(set(env.student_reward_names), set(env.student_reward_scales))
         cls = type(env)
-        for name in ("lin_vel_z", "ang_vel_xy", "orientation", "feet_air_time",
-                     "feet_slip", "feet_stumble", "feet_contact_forces"):
+        for name in ("lin_vel_z", "ang_vel_xy", "orientation"):
             self.assertNotIn("_reward_" + name, cls.__dict__)
             function = env.student_reward_functions[env.student_reward_names.index(name)]
             self.assertEqual(function.__name__, "_reward_student_" + name)
@@ -93,22 +108,21 @@ class NativeRegressionTests(unittest.TestCase):
         env._prepare_reward_function()
         self.assertEqual(env.reward_names, ["action_rate"])
         self.assertEqual(env.reward_scales["action_rate"], -.03*env.dt)
-        self.assertEqual(len(env.student_reward_functions), 31)
-        self.assertEqual(tuple(env.previous_hand_box_pos.shape), (2, 2, 3))
-        self.assertEqual(env.student_body_indices["torso"], 6)
+        self.assertEqual(len(env.student_reward_functions), 13)
+        self.assertFalse(hasattr(env, "previous_hand_box_pos"))
+        self.assertEqual(env.student_body_indices, dict(pelvis=0))
 
     def test_all_configuration_values_and_inherited_teacher_config_unchanged(self):
         from test_mixed_handoff import MixedHandoffCfg, config_namespace
         golden = json.loads((Path(__file__).parent / "fixtures/mixed_handoff_scope2.json").read_text())
         env = fixture()
         class_to_dict = env._prepare_student_reward_function.__func__.__globals__["class_to_dict"]
-        for name, expected in golden["config"].items():
-            group = (env.cfg.student_rewards if hasattr(env.cfg.student_rewards, name)
-                     else env.cfg.student_termination)
-            value = getattr(group, name)
-            if name == "scales":
-                value = class_to_dict(value)
-            self.assertEqual(json.loads(json.dumps(value)), expected, name)
+        for name in ("carry_lin_vel_sigma", "carry_yaw_vel_sigma"):
+            self.assertEqual(getattr(env.cfg.student_rewards, name), golden["config"][name])
+        for name, value in class_to_dict(env.cfg.student_rewards.scales).items():
+            self.assertEqual(value, golden["config"]["scales"][name])
+        for name, value in class_to_dict(env.cfg.student_termination).items():
+            self.assertEqual(value, golden["config"][name])
         self.assertEqual(class_to_dict(MixedHandoffCfg().rewards),
                          class_to_dict(config_namespace["G1Cfg"]().rewards))
 

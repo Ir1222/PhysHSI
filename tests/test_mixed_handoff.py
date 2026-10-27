@@ -71,6 +71,7 @@ def environment_fixture(settings=None):
                            max_contact_force=350., only_positive_rewards=False,
                            soft_dof_vel_limit=.8, soft_torque_limit=.95),
                  normalization=NS(clip_actions=100.),
+                 diagnostics=NS(detailed=True),
                  student_rewards=MixedHandoffCfg().student_rewards,
                  student_termination=MixedHandoffCfg().student_termination)
     env.handoff = HandoffState(2, "cpu", env.dt, settings or HandoffSettings())
@@ -96,6 +97,7 @@ def environment_fixture(settings=None):
     env._platform_height = .02
     env.projected_gravity_box = torch.tensor([[0., 0., -1.]]).repeat(2, 1)
     env.projected_gravity = env.projected_gravity_box.clone()
+    env.gravity_vec = env.projected_gravity.clone()
     env.roll = env.pitch = torch.zeros(2)
     env.object2goal_dist_xyz = torch.ones(2)
     env.box_cfg = NS(box_termination=False)
