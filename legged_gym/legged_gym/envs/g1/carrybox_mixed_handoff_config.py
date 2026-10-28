@@ -65,7 +65,7 @@ class MixedHandoffTrainingCfg(MixedHandoffCfg):
     """Candidate D; Viewer and original carrybox retain full Approach resets."""
     class env(MixedHandoffCfg.env):
         num_envs = G1Cfg.env.num_envs
-        episode_length_s = 20.0
+        episode_length_s = 30.0
         test = False
 
     class asset(MixedHandoffCfg.asset):
@@ -114,7 +114,9 @@ class MixedHandoffCfgPPO(G1CfgPPO):
         num_obs = 540
         num_one_step_obs = 54
         window_length = 10
-        amp_coef = .25
-        reward_scale = .5  # same discriminator reward scale as HIMOnPolicyRunner
+        # amp_coef = .25
+        # reward_scale = .5  # same discriminator reward scale as HIMOnPolicyRunner
+        amp_coef = 0.10
+        reward_scale = 0.10
         use_normalizer = False
         expert_config = "{LEGGED_GYM_ROOT_DIR}/resources/config/carrybox_carrywith_only.yaml"
