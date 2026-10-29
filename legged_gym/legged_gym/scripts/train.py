@@ -40,7 +40,8 @@ import torch
 def train(args, headless=False):
     env, env_cfg = task_registry.make_env(name=args.task, args=args)
     ppo_runner, train_cfg = task_registry.make_alg_runner(env=env, name=args.task, args=args)
-    if getattr(train_cfg, "runner_class_name", None) == "MixedHandoffOnPolicyRunner":
+    if getattr(train_cfg, "runner_class_name", None) in (
+            "MixedHandoffOnPolicyRunner", "VelTrackPoseAMPOnPolicyRunner"):
         ppo_runner.learn(train_cfg.runner.max_iterations,
                          optimize=not train_cfg.runner.collect_only,
                          max_optimizer_updates=train_cfg.runner.max_optimizer_updates)

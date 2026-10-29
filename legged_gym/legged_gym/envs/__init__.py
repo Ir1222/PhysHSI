@@ -43,3 +43,16 @@ from .g1.carrybox_mixed_handoff import MixedHandoff
 from .g1.carrybox_mixed_handoff_config import MixedHandoffTrainingCfg, MixedHandoffCfgPPO
 
 task_registry.register("carrybox_mixed_handoff", MixedHandoff, MixedHandoffTrainingCfg(), MixedHandoffCfgPPO())
+
+from .g1.carrybox_vel_track_pose_amp import VelTrackPoseAMP
+from .g1.carrybox_vel_track_pose_amp_config import (
+    VelTrackPoseAMPTrainingCfg,
+    VelTrackPoseAMPCfgPPO,
+)
+
+task_registry.register(
+    "carrybox_vel_track_pose_amp",
+    VelTrackPoseAMP,
+    VelTrackPoseAMPTrainingCfg(),
+    VelTrackPoseAMPCfgPPO(),
+)
