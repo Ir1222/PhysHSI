@@ -25,7 +25,8 @@ sys.path.insert(0, str(ROOT / "legged_gym"))
 from test_mixed_handoff import MATH, classes_from_source, config_namespace
 from legged_gym.mixed_handoff import load_actor
 from rsl_rl.modules import ActorCritic, AMP
-from rsl_rl.modules.masked_amp import project_amp, StudentAMPHistory
+from rsl_rl.modules.masked_amp import (StudentAMPHistory, add_gated_amp_reward,
+    classify_amp_mode, compute_tracking_gate, project_amp)
 from rsl_rl.algorithms.mixed_handoff_ppo import MixedHandoffPPO
 
 from rsl_rl.storage.mixed_handoff_rollout_storage import MixedHandoffRolloutStorage
@@ -56,20 +57,27 @@ def configuration(amp=True, steps=14, normalize=False):
                             activation="elu", init_noise_std=.4),
                 algorithm=dict(num_learning_epochs=1, num_mini_batches=2, schedule="fixed", learning_rate=2e-4),
                 runner=dict(num_steps_per_env=steps, save_interval=1),
-                amp=dict(enabled=amp, amp_coef=.25, reward_scale=.5, use_normalizer=normalize))
+                amp=dict(enabled=amp, num_obs=540, discriminator_num_obs=541,
+                         num_one_step_obs=54, window_length=10, style_weight=2., gate_floor=.1,
+                         stand_linear_threshold=.05, stand_yaw_threshold=.05,
+                         use_normalizer=normalize))
 
 
 class Expert:
     identity = dict(source="CarryWith-only", files=[dict(name="synthetic", sha256="test")], weights=[5., 2., 5.], fps=60., control_dt=.02)
 
-    def get_expert_obs(self, batch_size):
-        return torch.randn(batch_size, 540) * .1
+    def get_expert_obs(self, batch_size, stand_mode=None):
+        motion = torch.randn(batch_size, 540) * .1
+        mode = torch.zeros(batch_size) if stand_mode is None else stand_mode.float().cpu()
+        return torch.cat((motion, mode[:, None]), -1)
 
 
 class TensorEnvironment:
     """Two asynchronous Teacher->Student episodes; terminal obs differs from reset."""
     num_envs, device = 2, "cpu"
-    cfg = NS(normalization=NS(clip_observations=100.))
+    cfg = NS(normalization=NS(clip_observations=100.),
+             student_rewards=NS(carry_lin_vel_sigma=.25, carry_yaw_vel_sigma=.25))
+    dt = .02
 
     def __init__(self):
         self.handoff = NS(phase=torch.zeros(2, dtype=torch.long))
@@ -97,11 +105,13 @@ class TensorEnvironment:
         obs[dones], critic[dones] = -9., -9.
         self.amp = torch.cat((self.amp[:, 60:], torch.ones(2, 60) * self.t[:, None]), -1)
         amp = self.amp.clone()
-        diag = dict(executed_phase=owned, timeout=timeout, failure=failure,
+        diag = dict(executed_phase=owned, executed_command=torch.zeros(2, 3),
+                    timeout=timeout, failure=failure,
                     handoff_trigger=triggered, handoff_failure=dones & (owned == 0),
                     handoff_time=torch.where(self.handoff.phase == 1, .04, -1.),
                     **{"student/termination_reason": failure.long()*16 + timeout.long()*32,
-                       "student/linear_error": torch.tensor([.1, .2]),
+                       "student/linear_tracking_error": torch.zeros(2),
+                       "student/yaw_tracking_error": torch.zeros(2),
                        "student_reward_weighted/carry_box_tilt": torch.tensor([-.01, -.02])})
         self.t[dones] = 0
         self.handoff.phase[dones] = 0
@@ -113,7 +123,7 @@ def transition(n=2, **overrides):
     data = dict(observations=torch.randn(n, 738)*.1, next_observations=torch.randn(n, 738)*.1,
                 critic_observations=torch.randn(n, 126)*.1, next_critic_observations=torch.randn(n, 126)*.1,
                 actions=torch.randn(n, 29)*.1, mu=torch.zeros(n, 29), sigma=torch.ones(n, 29),
-                amp_observations=torch.randn(n, 540)*.1, values=torch.zeros(n), next_values=torch.zeros(n),
+                amp_observations=torch.randn(n, 541)*.1, values=torch.zeros(n), next_values=torch.zeros(n),
                 rewards=torch.ones(n), log_prob=torch.zeros(n), student_valid=torch.ones(n, dtype=torch.bool),
                 amp_valid=torch.zeros(n, dtype=torch.bool), dones=torch.zeros(n, dtype=torch.bool),
                 timeouts=torch.zeros(n, dtype=torch.bool), failures=torch.zeros(n, dtype=torch.bool),
@@ -333,6 +343,35 @@ class TrainingTests(unittest.TestCase):
         self.assertEqual(history.count.tolist(), [0, 9])
         self.assertEqual(history.step(torch.tensor([False, True]), torch.tensor([False, False])).tolist(), [False, True])
 
+    def test_gated_amp_formula_preserves_task_dt_scale_and_bounds(self):
+        task = torch.tensor([.12, -.03, .7])
+        raw = torch.tensor([1., .5, 1.])
+        gate = torch.tensor([1., .1, 1.])
+        valid = torch.tensor([True, True, False])
+        combined, bonus = add_gated_amp_reward(task, raw, gate, valid, .02, 2.)
+        torch.testing.assert_close(bonus, torch.tensor([.04, .002, 0.]))
+        torch.testing.assert_close(combined, task + bonus)
+        self.assertTrue((bonus >= 0).all() and (bonus <= .04).all())
+
+    def test_tracking_gate_and_three_axis_mode_classification(self):
+        gate = compute_tracking_gate(torch.tensor([0., 1.]), torch.tensor([0., 1.]), .25, .25, .1)
+        self.assertEqual(gate[0].item(), 1.)
+        self.assertGreaterEqual(gate[1].item(), .1)
+        self.assertLess(gate[1].item(), .101)
+        commands = torch.tensor([[0., 0., 0.], [.2, 0., 0.], [0., .2, 0.], [0., 0., .2]])
+        self.assertEqual(classify_amp_mode(commands, .05, .05).tolist(), [True, False, False, False])
+
+    def test_mode_transition_requires_ten_new_same_mode_frames(self):
+        history = StudentAMPHistory(1, "cpu")
+        student, done = torch.tensor([True]), torch.tensor([False])
+        for _ in range(10):
+            valid = history.step(student, done, torch.tensor([False]))
+        self.assertTrue(valid.item())
+        self.assertFalse(history.step(student, done, torch.tensor([True])).item())
+        for _ in range(8):
+            self.assertFalse(history.step(student, done, torch.tensor([True])).item())
+        self.assertTrue(history.step(student, done, torch.tensor([True])).item())
+
     def test_real_runner_ownership_reward_blending_and_terminal_bootstrap(self):
         runner = self.runner(steps=18)
         runner.reset()
@@ -348,7 +387,7 @@ class TrainingTests(unittest.TestCase):
         self.assertFalse(d["amp_valid"][:13, 1].any())
         self.assertTrue(d["amp_valid"][13, 1])
         self.assertAlmostEqual(d["rewards"][10, 0].item(), .12, places=6)
-        self.assertAlmostEqual(d["rewards"][11, 0].item(), .75*.12 + .25*.5, places=6)
+        self.assertAlmostEqual(d["rewards"][11, 0].item(), .12 + .02*2., places=6)
         self.assertEqual(d["next_values"][15, 0].item(), 0.)  # failure
         with torch.no_grad():
             expected = runner.alg.actor_critic.evaluate(torch.full((1, 126), 7.)).item()
@@ -367,7 +406,7 @@ class TrainingTests(unittest.TestCase):
             runner.alg.update(storage)
         self.assertEqual(len(recorded), 4)
         self.assertTrue(all(x.abs().max() < 2 for x in recorded))
-        self.assertEqual(normalizer.mean.shape, (540,))
+        self.assertEqual(normalizer.mean.shape, (541,))
         self.assertTrue(torch.isfinite(normalizer.var).all())
 
     def test_resume_round_trip_and_existing_viewer_loader(self):
@@ -425,7 +464,7 @@ class TrainingTests(unittest.TestCase):
         runner.load(path)  # Missing optional metadata does not block resume.
         for section, key, value in (("algorithm", "learning_rate", .9),
                                     ("policy", "activation", "relu"),
-                                    ("amp", "amp_coef", .9),
+                                    ("amp", "style_weight", .9),
                                     ("environment", "control", {"action_scale": .9}),
                                     ("environment", "init_state", {"default_joint_angles": {"joint": 1.}})):
             changed = copy.deepcopy(old)
@@ -499,7 +538,9 @@ class ExpertTests(unittest.TestCase):
         sampler = self.sampler()
         self.assertEqual(sampler.skills, ["carryWith"])
         self.assertEqual(sampler.motion_weights_tot.tolist(), [5., 2., 5.])
-        obs = sampler.get_expert_obs(12000).reshape(-1, 10, 54)
+        conditioned = sampler.get_expert_obs(12000)
+        self.assertTrue((conditioned[:, -1] == 0).all())
+        obs = conditioned[:, :540].reshape(-1, 10, 54)
         clip = (obs[:, :, 0] / 100).floor()
         self.assertTrue((clip == clip[:, :1]).all())
         probability = torch.bincount(clip[:, 0].long(), minlength=4)[1:].float() / len(obs)
@@ -507,7 +548,7 @@ class ExpertTests(unittest.TestCase):
         torch.testing.assert_close(obs[:, 1:, 0]-obs[:, :-1, 0], torch.full((len(obs), 9), 1.2), atol=5e-5, rtol=0)
         torch.testing.assert_close(obs[0, :, 1:30], torch.arange(29.).repeat(10, 1)*.01)
         torch.testing.assert_close(obs[0, :, 45:48], torch.tensor([.2, 0., .1]).repeat(10, 1))
-        self.assertEqual(obs.flatten(1).shape, (12000, 540))
+        self.assertEqual(conditioned.shape, (12000, 541))
 
     def test_tracked_carrywith_dataset_loads_from_default_yaml_without_override(self):
         config = ROOT / "legged_gym/resources/config/carrybox_carrywith_only.yaml"
@@ -519,7 +560,7 @@ class ExpertTests(unittest.TestCase):
         self.assertEqual(sampler.motion_len_tot.tolist(), [256, 194, 323])
         self.assertEqual(sampler.motion_weights_tot.tolist(), [5., 2., 5.])
         obs = sampler.get_expert_obs(32)
-        self.assertEqual(obs.shape, (32, 540))
+        self.assertEqual(obs.shape, (32, 541))
         self.assertTrue(torch.isfinite(obs).all())
 
     def test_expert_uses_same_projection_and_motionlib_preprocessing(self):
@@ -528,7 +569,7 @@ class ExpertTests(unittest.TestCase):
                          sampler.motion_box_pos, sampler.motion_base_lin_vel, sampler.motion_base_ang_vel,
                          sampler.motion_base_rot], -1)
         with patch("torch.multinomial", return_value=torch.zeros(1, dtype=torch.long)), patch("torch.rand", return_value=torch.zeros(1)):
-            obs = sampler.get_expert_obs(1)
+            obs = sampler.get_expert_obs(1)[:, :540]
         times = torch.arange(10) * 1.2
         w = (times-times.floor())[:, None]
         expected = raw[times.long()]*(1-w) + raw[times.ceil().long()]*w
@@ -539,8 +580,23 @@ class ExpertTests(unittest.TestCase):
         with self.assertRaisesRegex(FileNotFoundError, "carrywith3.pt"):
             self.sampler()
         self.config.write_text(yaml.safe_dump(dict(motions=dict(hold=self.entries))))
-        with self.assertRaisesRegex(ValueError, "ONLY carryWith"):
+        with self.assertRaisesRegex(ValueError, "carryWith and optional hold"):
             validate_carrywith_config(self.config)
+
+    def test_tracked_hold_and_carry_are_sampled_by_explicit_mode(self):
+        config = ROOT / "legged_gym/resources/config/carrybox_hold_carrywith_amp.yaml"
+        _, motions, files = validate_carrywith_config(config)
+        self.assertEqual(set(motions), {"carryWith", "hold"})
+        self.assertEqual(len(files), 7)
+        with contextlib.redirect_stdout(io.StringIO()):
+            sampler = CarryWithMotionLib(config, str(self.mapping), self.names, 60, "cpu", .02, .7)
+        labels = torch.tensor([True, False, True, False])
+        values = {"hold": 1., "carryWith": 2.}
+        with patch.object(sampler, "_sample_motion",
+                          side_effect=lambda skill, n: torch.full((n, 540), values[skill])):
+            obs = sampler.get_expert_obs(4, labels)
+        torch.testing.assert_close(obs[:, -1], labels.float())
+        torch.testing.assert_close(obs[:, 0], torch.tensor([1., 2., 1., 2.]))
 
     def test_temporally_insufficient_clip_rejected(self):
         path = self.root / "carrywith1.pt"
@@ -603,7 +659,7 @@ class TrainingRegressionTests(unittest.TestCase):
         self.assertEqual(training.asset.box.reset_mode, "random")
         self.assertEqual(training.asset.box.skill, ["pickUp"])
         self.assertEqual(training.asset.box.skill_init_prob, [1.])
-        self.assertEqual(training.env.episode_length_s, 20.)
+        self.assertEqual(training.env.episode_length_s, 30.)
         self.assertEqual(training.handoff.stable_duration_s, .1)
         self.assertEqual(training.handoff.student_initial_stand_duration_s, 0.)
         self.assertEqual(viewer.asset.box.reset_mode, "default")

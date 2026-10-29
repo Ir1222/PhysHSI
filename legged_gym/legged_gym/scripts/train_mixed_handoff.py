@@ -20,7 +20,7 @@ def get_args():
     parser.add_argument("--teacher_checkpoint", required=True)
     parser.add_argument("--student_init_checkpoint", help="Fresh Actor/std initialization; defaults to Teacher")
     parser.add_argument("--amp_expert_config")
-    parser.add_argument("--amp_motion_root", help="Directory containing the three original carrywith*.pt files")
+    parser.add_argument("--amp_motion_root", help="Dataset root containing carryWith/ and hold_synthetic/, or a flat expert directory")
     parser.add_argument("--num_envs", type=int, default=4096)
     parser.add_argument("--steps_per_env", type=int, default=100)
     parser.add_argument("--max_iterations", type=int, default=20000, help="Collection iterations, including Teacher warmup")

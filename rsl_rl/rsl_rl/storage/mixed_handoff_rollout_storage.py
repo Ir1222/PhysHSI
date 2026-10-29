@@ -7,7 +7,7 @@ class MixedHandoffRolloutStorage:
                  actions=29, device="cpu"):
         shapes = dict(observations=actor_obs, next_observations=actor_obs,
                       critic_observations=critic_obs, next_critic_observations=critic_obs,
-                      actions=actions, mu=actions, sigma=actions, amp_observations=540)
+                      actions=actions, mu=actions, sigma=actions, amp_observations=541)
         self.data = {k: torch.zeros(num_steps, num_envs, n, device=device)
                      for k, n in shapes.items()}
         for k in ("rewards", "values", "next_values", "log_prob", "returns", "advantages"):

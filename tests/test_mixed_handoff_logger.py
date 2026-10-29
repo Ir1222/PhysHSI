@@ -60,7 +60,8 @@ class TerminalLoggerTests(unittest.TestCase):
                        student_valid_ratio=.75, amp_valid_fraction=.5, handoff_success_rate=.75,
                        **{"Perf/total_fps": 200., "Perf/collection_time": .15, "Perf/learning_time": .05,
                           "Policy/mean_noise_std": .31, "performance/task_reward": .12,
-                          "performance/amp_reward_valid": .4, "performance/student/completed_survival_s": 1.5,
+                          "performance/amp_raw_valid": .4, "performance/tracking_gate": .7,
+                          "performance/amp_bonus": .02, "performance/student/completed_survival_s": 1.5,
                           "performance/student_reward_weighted/carry_box_tilt": -99.,
                           "performance/task_reward_std": 555.})
         before = copy.deepcopy(metrics)
@@ -71,7 +72,8 @@ class TerminalLoggerTests(unittest.TestCase):
         self.assertTrue(all(len(line) <= 80 for line in text.splitlines()))
         for label in ("Learning/Collection iteration 7/20 (final)", "Computation:", "Collection time:", "Learning time:",
                       "Value function loss:", "Surrogate loss:", "Mean action noise std:", "Learning rate:",
-                      "Mean Student task reward:", "Mean AMP reward:", "Student-valid ratio:", "AMP-valid fraction:",
+                      "Mean Student task reward:", "Mean raw AMP reward:", "Mean tracking gate:",
+                      "Mean AMP bonus:", "Student-valid ratio:", "AMP-valid fraction:",
                       "Handoff success rate:", "Mean completed Student survival:", "Actual PPO optimizer updates:",
                       "Total timesteps:", "Total time (this run):", "ETA (collection limit):"):
             self.assertIn(label, text)
@@ -87,7 +89,7 @@ class TerminalLoggerTests(unittest.TestCase):
         runner.log({"value": float("nan"), "surrogate": float("inf"), "student_valid_count": 0,
                     "amp_valid_fraction": 0., "handoff_success_rate": 0.}, 1, 1., 0.)
         text = self.output.getvalue()
-        for label in ("Value function loss", "Surrogate loss", "Mean Student task reward", "Mean AMP reward",
+        for label in ("Value function loss", "Surrogate loss", "Mean Student task reward", "Mean raw AMP reward",
                       "AMP-valid fraction", "Handoff success rate", "Mean completed Student survival"):
             line = next(line for line in text.splitlines() if label + ":" in line)
             self.assertTrue(line.endswith("N/A"), line)
@@ -223,8 +225,11 @@ class TerminalLoggerTests(unittest.TestCase):
         self.assertTrue((self.root / "logs/handoff_events.jsonl").read_text().strip())
         runner.writer.add_histogram.assert_not_called()
         scalars = {c.args[0]: c.args[1] for c in runner.writer.add_scalar.call_args_list}
-        self.assertAlmostEqual(scalars["Train/mean_reward"], 12.75 * (.12 + .15) / 2 + .625, places=6)
-        self.assertAlmostEqual(scalars["Train/mean_amp_reward"], 2.5, places=6)
+        self.assertAlmostEqual(scalars["Train/mean_reward"], 14 * (.12 + .15) / 2 + .2, places=6)
+        self.assertAlmostEqual(scalars["Train/mean_amp_reward"], .2, places=6)
+        self.assertAlmostEqual(scalars["Train/mean_amp_raw_reward"], 1., places=6)
+        self.assertAlmostEqual(scalars["Train/mean_amp_tracking_gate"], 1., places=6)
+        self.assertAlmostEqual(scalars["Train/mean_amp_bonus"], .04, places=6)
         metrics = self.metrics()[0]
         self.assertAlmostEqual(scalars["Loss/amp_loss"], metrics["amp_expert_loss"] +
                                metrics["amp_policy_loss"] + metrics["amp_gradient_penalty"])
@@ -248,7 +253,7 @@ class TerminalLoggerTests(unittest.TestCase):
         self.assertEqual(log.call_args.args[3], 0.)  # ETA on early completion.
         self.assertEqual(runner.collection_iteration, 1)
         self.assertEqual(runner.alg.optimizer_updates, 1)
-        self.assertIn("Mean AMP reward: N/A", self.output.getvalue())
+        self.assertIn("Mean raw AMP reward: N/A", self.output.getvalue())
         runner.assert_teacher_frozen()
 
     def test_timing_fps_and_elapsed_use_measured_times(self):

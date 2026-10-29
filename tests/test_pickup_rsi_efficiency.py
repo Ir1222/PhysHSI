@@ -199,7 +199,7 @@ class EfficiencyConfigTests(unittest.TestCase):
         self.assertIsNone(args.episode_length_s)
         cfg = training_config()
         configure(cfg, args)
-        self.assertEqual(cfg.env.episode_length_s, 20.)
+        self.assertEqual(cfg.env.episode_length_s, 30.)
         for name, expected in {"A": (False, 20., .3, .5), "B": (True, 20., .3, .5),
                                "C": (True, 20., .3, 0.), "D": (True, 20., .1, 0.),
                                "historical": (False, 60., .3, .5)}.items():

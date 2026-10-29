@@ -10,13 +10,15 @@ import torch
 from legged_gym.mixed_handoff import STUDENT_CONTROL, load_actor
 from rsl_rl.algorithms.mixed_handoff_ppo import MixedHandoffPPO
 from rsl_rl.modules import ActorCritic, AMP
-from rsl_rl.modules.masked_amp import StudentAMPHistory, project_amp
+from rsl_rl.modules.masked_amp import (StudentAMPHistory, add_gated_amp_reward,
+    classify_amp_mode, compute_tracking_gate, condition_amp_observation, project_amp)
 from rsl_rl.storage.mixed_handoff_rollout_storage import MixedHandoffRolloutStorage
 
 
 TRAINING_CONTRACT = dict(actor_obs=738, critic_obs=126, actions=29, history_frames=6,
-                         amp_obs=540, amp_frame_features=54, amp_history=10,
-                         expert_source="CarryWith-only", version=1)
+                         amp_motion_obs=540, amp_discriminator_obs=541,
+                         amp_frame_features=54, amp_history=10,
+                         expert_source="HOLD+CarryWith-mode-conditioned", version=2)
 
 
 def read_checkpoint(path):
@@ -70,21 +72,33 @@ class MixedHandoffOnPolicyRunner:
         if (isinstance(self.terminal_log_interval, bool)
                 or not isinstance(self.terminal_log_interval, int) or self.terminal_log_interval < 1):
             raise ValueError("terminal_log_interval must be a positive integer")
-        if not 0 <= amp_cfg["amp_coef"] <= 1 or amp_cfg["reward_scale"] < 0:
-            raise ValueError("AMP reward requires 0 <= amp_coef <= 1 and nonnegative reward_scale")
+        for retired in ("amp_coef", "reward_scale"):
+            if retired in amp_cfg:
+                raise ValueError(retired + " is retired; gated AMP uses style_weight and gate_floor")
+        if (amp_cfg.get("num_obs") != 540 or amp_cfg.get("discriminator_num_obs") != 541
+                or amp_cfg.get("num_one_step_obs") != 54 or amp_cfg.get("window_length") != 10):
+            raise ValueError("Gated AMP requires the 540D motion / 541D discriminator / 10-frame contract")
+        for name in ("style_weight", "gate_floor", "stand_linear_threshold", "stand_yaw_threshold"):
+            value = amp_cfg.get(name)
+            if not isinstance(value, (int, float)) or not math.isfinite(value):
+                raise ValueError("Invalid gated AMP parameter: " + name)
+        if amp_cfg["style_weight"] < 0 or not 0 <= amp_cfg["gate_floor"] <= 1:
+            raise ValueError("AMP style_weight must be nonnegative and gate_floor in [0, 1]")
+        if amp_cfg["stand_linear_threshold"] < 0 or amp_cfg["stand_yaw_threshold"] < 0:
+            raise ValueError("AMP Stand thresholds must be nonnegative")
         self.teacher, _ = load_actor(teacher_checkpoint, device)
         self.teacher_identity = file_identity(teacher_checkpoint)
         self.teacher_snapshot = {k: p.detach().clone() for k, p in self.teacher.state_dict().items()}
         ac = ActorCritic(738, 126, 6, 29, **train_cfg["policy"]).to(device)
         self.student_init = initialize_student(ac, student_init_checkpoint or teacher_checkpoint,
                                               device) if initialize else None
-        amp = AMP(540, amp_cfg["amp_coef"], device=device).to(device) if amp_cfg["enabled"] else None
+        amp = AMP(541, 0., device=device).to(device) if amp_cfg["enabled"] else None
         normalizer = None
         if amp is not None and expert is None:
-            raise ValueError("Enabled AMP requires independent CarryWith-only expert motion")
+            raise ValueError("Enabled AMP requires an independent HOLD/CarryWith expert motion library")
         if amp is not None and amp_cfg["use_normalizer"]:
             from rsl_rl.utils.utils import AmpNormalizer
-            normalizer = AmpNormalizer(540, device=device)
+            normalizer = AmpNormalizer(541, device=device)
         self.alg = MixedHandoffPPO(ac, amp, normalizer, expert, **train_cfg["algorithm"])
         self.storage = MixedHandoffRolloutStorage(env.num_envs, self.cfg["num_steps_per_env"], device=device)
         self.history = StudentAMPHistory(env.num_envs, device)
@@ -111,6 +125,7 @@ class MixedHandoffOnPolicyRunner:
         obs, critic = self.env.reset()
         self.obs, self.critic_obs = obs.to(self.device).clone(), critic.to(self.device).clone()
         self.history.count.zero_()
+        self.history.mode_initialized.zero_()
         self.episode_teacher_steps.zero_()
         self.episode_student_steps.zero_()
         self.episode_amp_steps.zero_()
@@ -152,15 +167,26 @@ class MixedHandoffOnPolicyRunner:
         bootstrap = student & ~failures & ((~dones & next_student) | (dones & timeouts))
         if bootstrap.any():
             next_values[bootstrap] = ac.evaluate(next_critic[bootstrap]).squeeze(-1)
-        amp_obs = project_amp(amp_state.to(self.device))
-        amp_valid = self.history.step(student, dones)
-        amp_reward = torch.zeros_like(task_reward)
-        reward = task_reward.clone()
+        amp_motion = project_amp(amp_state.to(self.device))
+        executed_command = diag["executed_command"].to(self.device)
+        stand_mode = classify_amp_mode(executed_command,
+            self.train_cfg["amp"]["stand_linear_threshold"],
+            self.train_cfg["amp"]["stand_yaw_threshold"])
+        amp_valid = self.history.step(student, dones, stand_mode)
+        amp_obs = condition_amp_observation(amp_motion, stand_mode)
+        linear_error = diag["student/linear_tracking_error"].to(self.device)
+        yaw_error = diag["student/yaw_tracking_error"].to(self.device)
+        gate = compute_tracking_gate(linear_error, yaw_error,
+            env.cfg.student_rewards.carry_lin_vel_sigma,
+            env.cfg.student_rewards.carry_yaw_vel_sigma,
+            self.train_cfg["amp"]["gate_floor"])
+        amp_raw = torch.zeros_like(task_reward)
         enabled = self.alg.amp is not None
         if enabled and amp_valid.any():
-            amp_reward[amp_valid] = self.alg.amp.predict_reward(amp_obs[amp_valid], self.alg.amp_normalizer).squeeze(-1) * self.train_cfg["amp"]["reward_scale"]
-            coef = self.train_cfg["amp"]["amp_coef"]
-            reward[amp_valid] = (1-coef) * task_reward[amp_valid] + coef * amp_reward[amp_valid]
+            amp_raw[amp_valid] = self.alg.amp.predict_reward(
+                amp_obs[amp_valid], self.alg.amp_normalizer).squeeze(-1)
+        reward, amp_bonus = add_gated_amp_reward(task_reward, amp_raw, gate, amp_valid,
+            getattr(env, "dt", .02), self.train_cfg["amp"]["style_weight"])
         # Both inputs are pre-reset when used for timeouts. Smoothness excludes
         # every done and phase boundary, so reset actor observations are harmless.
         self.storage.add(observations=self.obs, next_observations=obs,
@@ -175,8 +201,11 @@ class MixedHandoffOnPolicyRunner:
         failed = diag["handoff_failure"].to(self.device).bool()
         self._pending_counts += torch.stack(((~student).sum(), student.sum(), amp_valid.sum(),
                                             trigger.sum(), failed.sum()))
-        samples = dict(task_reward=task_reward[student], amp_reward=amp_reward[student], combined_reward=reward[student],
-                       amp_reward_valid=amp_reward[amp_valid] if enabled else amp_reward[:0],
+        samples = dict(task_reward=task_reward[student], amp_reward=amp_raw[student], combined_reward=reward[student],
+                       amp_reward_valid=amp_raw[amp_valid] if enabled else amp_raw[:0],
+                       amp_raw_valid=amp_raw[amp_valid] if enabled else amp_raw[:0],
+                       tracking_gate=gate[amp_valid] if enabled else gate[:0],
+                       amp_bonus=amp_bonus[amp_valid] if enabled else amp_bonus[:0],
                        handoff_time=diag["handoff_time"].to(self.device)[trigger])
         self.episode_teacher_steps += ~student
         self.episode_student_steps += student
@@ -208,7 +237,7 @@ class MixedHandoffOnPolicyRunner:
         })
         if self.writer:
             self._tb_episode_returns += torch.where(
-                student[:, None], torch.stack((reward, task_reward, amp_reward), dim=1), 0.)
+                student[:, None], torch.stack((reward, task_reward, amp_bonus), dim=1), 0.)
             self._tb_completed.append(torch.cat((self._tb_episode_returns[segments],
                 self.episode_student_steps[segments, None], self.episode_amp_steps[segments, None]), dim=1))
             self._tb_episode_returns[dones] = 0
@@ -296,7 +325,9 @@ class MixedHandoffOnPolicyRunner:
                  row("Learning rate", number(metrics.get("learning_rate"), ".2e")),
                  row("PPO KL", number(metrics.get("kl"), ".6f")),
                  row("Mean Student task reward", number(metrics.get("performance/task_reward"))),
-                 row("Mean AMP reward", number(metrics.get("performance/amp_reward_valid"))),
+                 row("Mean raw AMP reward", number(metrics.get("performance/amp_raw_valid"))),
+                 row("Mean tracking gate", number(metrics.get("performance/tracking_gate"))),
+                 row("Mean AMP bonus", number(metrics.get("performance/amp_bonus"))),
                  row("Student-valid ratio", number(metrics.get("student_valid_ratio"), ".2%")),
                  row("Cumulative Student ratio", number(metrics.get("student_step_fraction"), ".2%")),
                  row("Completed episode Student ratio", number(metrics.get("episode_student_fraction")
@@ -427,6 +458,9 @@ class MixedHandoffOnPolicyRunner:
                         "Perf/total_fps": metrics["Perf/total_fps"],
                         "Perf/collection_time": metrics["Perf/collection_time"],
                         "Perf/learning_time": metrics["Perf/learning_time"],
+                        "Train/mean_amp_raw_reward": metrics.get("performance/amp_raw_valid"),
+                        "Train/mean_amp_tracking_gate": metrics.get("performance/tracking_gate"),
+                        "Train/mean_amp_bonus": metrics.get("performance/amp_bonus"),
                     }
                     if "amp_gradient_penalty" in metrics:
                         scalars["Loss/amp_loss"] = (metrics["amp_expert_loss"] +
@@ -561,4 +595,5 @@ class MixedHandoffOnPolicyRunner:
         # Simulator state is not restored: resume begins a real Teacher episode.
         self.obs = self.critic_obs = None
         self.history.count.zero_()
+        self.history.mode_initialized.zero_()
         self.storage.clear()

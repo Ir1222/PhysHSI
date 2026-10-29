@@ -65,7 +65,7 @@ def audit(motion_root=None, samples=12000):
         clips.append(dict(file=path.name, frames=len(errors), end_effector_max_error_m=max_error.tolist(),
                           base_height_max_error_m=max(height_errors)))
     observations = sampler.get_expert_obs(samples)
-    if observations.shape != (samples, 540) or not torch.isfinite(observations).all():
+    if observations.shape != (samples, 541) or not torch.isfinite(observations).all():
         raise ValueError("Invalid real expert samples")
     return dict(identity=sampler.identity, clips=clips, samples=samples,
                 sample_shape=list(observations.shape), finite=True)

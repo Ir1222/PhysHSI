@@ -114,9 +114,10 @@ class MixedHandoffCfgPPO(G1CfgPPO):
         num_obs = 540
         num_one_step_obs = 54
         window_length = 10
-        # amp_coef = .25
-        # reward_scale = .5  # same discriminator reward scale as HIMOnPolicyRunner
-        amp_coef = 0.10
-        reward_scale = 0.10
+        discriminator_num_obs = 541  # 540D motion + one Stand(1)/Moving(0) condition.
+        style_weight = 2.0
+        gate_floor = 0.1
+        stand_linear_threshold = 0.05
+        stand_yaw_threshold = 0.05
         use_normalizer = False
-        expert_config = "{LEGGED_GYM_ROOT_DIR}/resources/config/carrybox_carrywith_only.yaml"
+        expert_config = "{LEGGED_GYM_ROOT_DIR}/resources/config/carrybox_hold_carrywith_amp.yaml"

@@ -87,7 +87,10 @@ class MixedHandoffPPO:
             if self.amp is not None and len(policy_samples):
                 ids = torch.randint(len(policy_samples), (min(self.amp_batch_size, len(policy_samples)),), device=policy_samples.device)
                 policy = policy_samples[ids]
-                expert = self.motion_buffer.get_expert_obs(len(ids)).to(policy.device)
+                # The final dimension is the explicit Stand(1)/Moving(0)
+                # condition. Match expert modes to policy modes in every batch.
+                expert = self.motion_buffer.get_expert_obs(
+                    len(ids), stand_mode=policy[:, -1].bool()).to(policy.device)
                 if self.amp_normalizer is not None:
                     # Update with RAW observations, never normalized tensors.
                     self.amp_normalizer.update(policy)

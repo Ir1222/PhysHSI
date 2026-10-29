@@ -5,7 +5,6 @@ import copy
 import io
 import json
 from pathlib import Path
-import subprocess
 import tempfile
 from types import SimpleNamespace as NS
 import unittest
@@ -37,53 +36,33 @@ class RefactorTests(unittest.TestCase):
             events = [json.loads(line) for line in (root / "log/handoff_events.jsonl").read_text().splitlines()]
             self.assertEqual([row["env_id"] for row in events], [0, 1])
             self.assertTrue(all(row["handoff_trigger"] for row in events))
-            self.assertIn("student/linear_error", events[0])
+            self.assertIn("student/linear_tracking_error", events[0])
             self.assertEqual(events[0]["student/termination_reason"], 0)
             runner.writer.close()
 
-    def test_baseline_rollout_gae_ppo_amp_and_weights_are_identical(self):
-        source = subprocess.check_output([
-            "git", "show", "6beaf95:rsl_rl/rsl_rl/runners/mixed_handoff_on_policy_runner.py"], cwd=ROOT).decode()
-        baseline = {"__name__": "baseline_runner"}
-        exec(compile(source, "baseline_runner.py", "exec"), baseline)
-        from legged_gym.mixed_handoff import load_actor
-        baseline["load_actor"] = lambda path, contract, device, legacy: load_actor(path, device)
+    def test_gated_amp_preserves_actor_critic_contract_and_updates_fresh_student(self):
         torch.set_num_threads(1)
         with tempfile.TemporaryDirectory() as folder, contextlib.redirect_stdout(io.StringIO()):
             path = Path(folder) / "teacher.pt"
             torch.manual_seed(7)
             torch.save(dict(model_state_dict=actor_critic().state_dict()), path)
-            results = []
-            for cls in (baseline["MixedHandoffOnPolicyRunner"], MixedHandoffOnPolicyRunner):
-                torch.manual_seed(123)
-                args = ({},) if cls is baseline["MixedHandoffOnPolicyRunner"] else ()
-                runner = cls(TensorEnvironment(), configuration(True, 36), path, *args, expert=Expert())
-                runner.reset()
-                samples = [{k: v.clone() for k, v in runner.collect_step().items()} for _ in range(36)]
-                for sample in samples:
-                    sample.pop("episode_student_fraction", None)
-                    sample.pop("student/segment_duration_s", None)
-                rollout = copy.deepcopy(runner.storage.data)
-                runner.storage.compute_returns(runner.alg.gamma, runner.alg.lam)
-                returns = runner.storage.data["returns"].clone()
-                metrics = runner.alg.update(runner.storage)
-                runner.assert_teacher_frozen()
-                results.append((samples, rollout, returns, metrics, copy.deepcopy(runner.alg.actor_critic.state_dict()),
-                                copy.deepcopy(runner.alg.amp.state_dict())))
-            def compare(a, b):
-                if isinstance(a, dict):
-                    self.assertEqual(a.keys(), b.keys())
-                    for k in a:
-                        compare(a[k], b[k])
-                elif isinstance(a, (tuple, list)):
-                    self.assertEqual(len(a), len(b))
-                    for x, y in zip(a, b):
-                        compare(x, y)
-                elif isinstance(a, torch.Tensor):
-                    torch.testing.assert_close(a, b, atol=0, rtol=0)
-                else:
-                    self.assertEqual(a, b)
-            compare(*results)
+            runner = MixedHandoffOnPolicyRunner(
+                TensorEnvironment(), configuration(True, 36), path, expert=Expert())
+            self.assertEqual(runner.alg.actor_critic.num_actor_obs, 738)
+            self.assertEqual(runner.alg.actor_critic.num_critic_obs, 126)
+            self.assertEqual(runner.alg.actor_critic.num_actions, 29)
+            self.assertEqual(runner.alg.amp.trunk[0].in_features, 541)
+            self.assertEqual(runner.storage.data["amp_observations"].shape[-1], 541)
+            before = copy.deepcopy(runner.alg.actor_critic.state_dict())
+            runner.reset()
+            for _ in range(36):
+                runner.collect_step()
+            runner.storage.compute_returns(runner.alg.gamma, runner.alg.lam)
+            metrics = runner.alg.update(runner.storage)
+            self.assertEqual(metrics["updated"], 1)
+            self.assertTrue(any(not torch.equal(value, before[key])
+                                for key, value in runner.alg.actor_critic.state_dict().items()))
+            runner.assert_teacher_frozen()
 
     def test_registry_dispatch_preserves_original_runner(self):
         from test_mixed_handoff import classes_from_source
