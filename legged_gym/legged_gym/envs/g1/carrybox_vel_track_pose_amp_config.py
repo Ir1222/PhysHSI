@@ -34,11 +34,28 @@ class VelTrackPoseAMPCfg(G1Cfg):
     class diagnostics:
         detailed = False  # Opt in for Viewer CSV / detailed reward debugging.
 
+    class gait:
+        contact_threshold_N = 1.0
+        moving_threshold = 0.1
+        slip_tolerance_m_s = 0.05
+        horizontal_speed_scale_m_s = 0.30
+        target_height_m = 0.04
+        scuff_height_m = 0.02
+        air_time_min_s = 0.06
+        air_time_range_s = 0.20
+        geometry_max_points = 128
+        geometry_fit_tolerance_m = 0.0005
+        geometry_validation_tolerance_m = 0.001
+
     class student_rewards:
         class scales:
-            carry_lin_vel_tracking = 3.0
-            carry_yaw_vel_tracking = 2.5
+            carry_lin_vel_tracking = 2.5 #3.0
+            carry_yaw_vel_tracking = 3.0
             carry_bilateral_contact = 0.5
+            gait_foot_slip = -0.05
+            gait_swing_clearance = 0.08
+            gait_foot_scuff = -0.05
+            gait_air_time = 0.0
             lin_vel_z = -1.0
             ang_vel_xy = -0.05
             orientation = -1.0

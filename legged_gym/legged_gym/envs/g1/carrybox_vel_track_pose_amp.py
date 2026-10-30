@@ -4,6 +4,7 @@ import math
 import json
 
 import torch
+import torch.nn.functional as F
 from isaacgym.torch_utils import quat_rotate_inverse
 
 from .carrybox import LeggedRobot
@@ -11,6 +12,15 @@ from legged_gym.mixed_handoff import HandoffSettings, HandoffState, STUDENT_CONT
 from legged_gym.pickup_rsi import sample_pickup_time, pickup_box_velocity
 from legged_gym.utils.helpers import class_to_dict
 from legged_gym.utils.torch_utils import calc_heading_quat
+
+
+GAIT_REWARD_NAMES = (
+    "gait_foot_slip",
+    "gait_swing_clearance",
+    "gait_foot_scuff",
+    "gait_air_time",
+)
+
 
 class VelTrackPoseAMP(LeggedRobot):
     def reset(self):
@@ -91,7 +101,165 @@ class VelTrackPoseAMP(LeggedRobot):
         self.gate_hand_indices = [index(side + "_rubber_hand") for side in ("left", "right")]
         self.gate_palm_indices = [index(side + "_palm_link") for side in ("left", "right")]
         self.student_body_indices = dict(pelvis=index(self.cfg.control.upper_body_link))
+        self._init_gait_buffers()
         self._init_student_carry_buffers()
+
+    def _init_gait_buffers(self):
+        from isaacgym import gymapi
+        from legged_gym import LEGGED_GYM_ROOT_DIR
+        from legged_gym.utils.gait_geometry import build_gait_geometry
+
+        if self.cfg.terrain.mesh_type != "plane":
+            raise ValueError("Gait sole clearance requires the configured plane terrain")
+        if not torch.allclose(self.env_origins[:, 2], torch.zeros_like(self.env_origins[:, 2]),
+                              atol=1e-6, rtol=0):
+            raise ValueError("Gait sole clearance requires the current world-Z=0 plane geometry")
+        gait = self.cfg.gait
+        for name in (
+            "contact_threshold_N",
+            "moving_threshold",
+            "horizontal_speed_scale_m_s",
+            "target_height_m",
+            "scuff_height_m",
+            "air_time_range_s",
+            "geometry_fit_tolerance_m",
+            "geometry_validation_tolerance_m",
+        ):
+            value = getattr(gait, name)
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError("Gait parameter must be positive and finite: " + name)
+        if (not math.isfinite(gait.slip_tolerance_m_s) or gait.slip_tolerance_m_s < 0
+                or not math.isfinite(gait.air_time_min_s) or gait.air_time_min_s < 0):
+            raise ValueError("Gait tolerances must be nonnegative and finite")
+        if (isinstance(gait.geometry_max_points, bool)
+                or not isinstance(gait.geometry_max_points, int)
+                or not 4 <= gait.geometry_max_points <= 256):
+            raise ValueError("gait.geometry_max_points must be an integer in [4, 256]")
+
+        body_names = self.gym.get_actor_rigid_body_names(self.envs[0], self.actor_handles[0])
+        foot_names = ("left_ankle_roll_link", "right_ankle_roll_link")
+        indices = []
+        for name in foot_names:
+            if name not in body_names:
+                raise ValueError("Missing gait rigid body: " + name)
+            local_index = body_names.index(name)
+            resolved = [
+                self.gym.get_actor_rigid_body_index(env, actor, local_index, gymapi.DOMAIN_ENV)
+                for env, actor in zip(self.envs, self.actor_handles)
+            ]
+            if len(set(resolved)) != 1 or not 0 <= resolved[0] < self.contact_forces.shape[1]:
+                raise ValueError("Invalid environment-domain gait body: " + name)
+            indices.append(resolved[0])
+        if indices[0] == indices[1]:
+            raise ValueError("Left and right gait bodies must be distinct")
+        self.gait_feet_indices = torch.tensor(indices, device=self.device, dtype=torch.long)
+
+        urdf = self.cfg.asset.file.format(LEGGED_GYM_ROOT_DIR=LEGGED_GYM_ROOT_DIR)
+        self.gait_geometry = build_gait_geometry(
+            urdf,
+            foot_names,
+            gait.geometry_max_points,
+            gait.geometry_fit_tolerance_m,
+            gait.geometry_validation_tolerance_m,
+        )
+        bodies = self.gait_geometry["bodies"]
+        count = max(bodies[name]["point_count"] for name in foot_names)
+        points = [
+            bodies[name]["points"] + [bodies[name]["points"][0]] * (count - bodies[name]["point_count"])
+            for name in foot_names
+        ]
+        self.gait_sole_points = self.dof_pos.new_tensor(points)
+        self.gait_geometry["body_indices_domain_env"] = dict(zip(foot_names, indices))
+
+        contact = torch.zeros(self.num_envs, 2, dtype=torch.bool, device=self.device)
+        self.gait_contact_raw = contact.clone()
+        self.gait_previous_raw = contact.clone()
+        self.gait_contact_filtered = contact.clone()
+        self.gait_touchdown = contact.clone()
+        self.gait_swing = contact.clone()
+        self.gait_stance_seen = contact.clone()
+        self.gait_air_time = self.dof_pos.new_zeros(self.num_envs, 2)
+        self.gait_preceding_air_time = self.gait_air_time.clone()
+        self.gait_horizontal_velocity = self.dof_pos.new_zeros(self.num_envs, 2, 2)
+        self.gait_horizontal_speed = self.gait_air_time.clone()
+        self.gait_clearance = self.gait_air_time.clone()
+        self.gait_previous_owner = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self.gait_history_valid = self.gait_previous_owner.clone()
+
+    def _reset_gait_history(self, env_ids):
+        for name in (
+            "contact_raw",
+            "previous_raw",
+            "contact_filtered",
+            "touchdown",
+            "swing",
+            "stance_seen",
+            "air_time",
+            "preceding_air_time",
+            "horizontal_velocity",
+            "horizontal_speed",
+            "clearance",
+            "previous_owner",
+            "history_valid",
+        ):
+            getattr(self, "gait_" + name)[env_ids] = 0
+
+    def _gait_moving(self):
+        threshold = self.cfg.gait.moving_threshold
+        student = self.executed_phase == STUDENT_CONTROL
+        command = self.executed_command
+        return student & ((command[:, :2].norm(dim=-1) > threshold)
+                          | (command[:, 2].abs() > threshold))
+
+    def _update_gait_state(self):
+        student = self.executed_phase == STUDENT_CONTROL
+        changed = ~self.gait_history_valid | (self.gait_previous_owner != student)
+        self._reset_gait_history(changed)
+        history = ~changed
+        body = self.rigid_body_states[:, self.gait_feet_indices]
+        raw = self.contact_forces[:, self.gait_feet_indices].norm(dim=-1) > self.cfg.gait.contact_threshold_N
+        filtered = raw | self.gait_previous_raw
+        moving = self._gait_moving()
+        self.gait_touchdown.copy_(filtered & ~self.gait_contact_filtered & history[:, None]
+                                  & self.gait_stance_seen & (self.gait_air_time > 0))
+        self.gait_preceding_air_time.copy_(self.gait_air_time)
+        self.gait_contact_raw.copy_(raw)
+        self.gait_contact_filtered.copy_(filtered)
+        self.gait_previous_raw.copy_(raw)
+        self.gait_swing.copy_(~filtered)
+        self.gait_stance_seen &= moving[:, None]
+        self.gait_stance_seen |= filtered & moving[:, None]
+        self.gait_air_time.copy_(torch.where(
+            ~filtered & moving[:, None], self.gait_air_time + self.dt, 0.0
+        ))
+        self.gait_horizontal_velocity.copy_(body[:, :, 7:9])
+        self.gait_horizontal_speed.copy_(self.gait_horizontal_velocity.norm(dim=-1))
+
+        points = self.gait_sole_points[None].expand(self.num_envs, -1, -1, -1)
+        quaternion = F.normalize(body[:, :, None, 3:7], dim=-1)
+        xyz = quaternion[..., :3].expand_as(points)
+        tangent = 2 * torch.cross(xyz, points, dim=-1)
+        rotated = points + quaternion[..., 3:4] * tangent + torch.cross(xyz, tangent, dim=-1)
+        # The configured plane is world Z=0; environment origins have zero Z.
+        self.gait_clearance.copy_(body[:, :, 2] + rotated[..., 2].amin(dim=-1))
+        self.gait_previous_owner.copy_(student)
+        self.gait_history_valid[:] = True
+
+    def _gait_physical_diagnostics(self):
+        moving = self._gait_moving()[:, None]
+        nan = torch.full_like(self.gait_horizontal_speed, float("nan"))
+        stance = moving & self.gait_contact_filtered
+        swing = moving & self.gait_swing
+        swing_motion = swing & (self.gait_horizontal_speed > self.cfg.gait.slip_tolerance_m_s)
+        return {
+            "student/stance_slip_m_s": torch.where(stance, self.gait_horizontal_speed, nan),
+            "student/swing_clearance_m": torch.where(swing, self.gait_clearance, nan),
+            "student/low_clearance_swing_fraction": torch.where(
+                swing_motion,
+                (self.gait_clearance < self.cfg.gait.scuff_height_m).float(),
+                nan,
+            ),
+        }
 
     def _init_student_carry_buffers(self):
         self.detailed_diagnostics = self.cfg.diagnostics.detailed
@@ -133,6 +301,12 @@ class VelTrackPoseAMP(LeggedRobot):
             prefix = "_reward_student_" if name in student_specific else "_reward_"
             self.student_reward_names.append(name)
             self.student_reward_functions.append(getattr(self, prefix + name))
+        if len(self.student_reward_names) != len(set(self.student_reward_names)):
+            raise ValueError("Duplicate Student reward name")
+        overlap = set(GAIT_REWARD_NAMES) & set(self.reward_names)
+        if overlap:
+            raise ValueError("Gait reward is already registered by the inherited task: "
+                             + ", ".join(sorted(overlap)))
         self.student_episode_sums = {
             name: torch.zeros(self.num_envs, device=self.device)
             for name in self.student_reward_scales
@@ -282,6 +456,7 @@ class VelTrackPoseAMP(LeggedRobot):
     def compute_reward(self):
         # Gate evaluation may already have advanced handoff.phase. Reward
         # ownership and commands always belong to the action actually executed.
+        self._update_gait_state()
         student = self.executed_phase == STUDENT_CONTROL
         teacher = ~student
         diagnostics = self.extras["handoff"]
@@ -309,6 +484,10 @@ class VelTrackPoseAMP(LeggedRobot):
             if self.detailed_diagnostics:
                 diagnostics["student_reward_raw/" + name] = raw.detach().clone()
                 diagnostics["student_reward_weighted/" + name] = contribution.detach().clone()
+            if name in GAIT_REWARD_NAMES:
+                diagnostics["student/" + name] = raw.detach().clone()
+        diagnostics.update({name: value.detach() for name, value in
+                            self._gait_physical_diagnostics().items()})
         if self.detailed_diagnostics:
             diagnostics["student_reward_before_clip"] = student_total.detach().clone()
         if self.cfg.rewards.only_positive_rewards:
@@ -366,6 +545,7 @@ class VelTrackPoseAMP(LeggedRobot):
             self.extras["episode"].update(summary)
         if len(env_ids) and hasattr(self, "handoff"):
             self._reset_student_carry_buffers(env_ids)
+            self._reset_gait_history(env_ids)
             self.handoff.reset(env_ids)
             if self.detailed_diagnostics:
                 self.teacher_last_action[env_ids] = 0
@@ -443,6 +623,31 @@ class VelTrackPoseAMP(LeggedRobot):
 
     def _reward_carry_bilateral_contact(self):
         return self.hand_contact_filt.all(-1).float()
+
+    def _reward_gait_foot_slip(self):
+        gait = self.cfg.gait
+        slip = ((self.gait_horizontal_speed - gait.slip_tolerance_m_s)
+                / gait.horizontal_speed_scale_m_s).clamp(0, 1)
+        return (slip * self.gait_contact_filtered).mean(-1) * self._gait_moving()
+
+    def _reward_gait_swing_clearance(self):
+        gait = self.cfg.gait
+        motion = ((self.gait_horizontal_speed - gait.slip_tolerance_m_s)
+                  / gait.horizontal_speed_scale_m_s).clamp(0, 1)
+        clearance = (self.gait_clearance / gait.target_height_m).clamp(0, 1)
+        return (self.gait_swing * motion * clearance).mean(-1) * self._gait_moving()
+
+    def _reward_gait_foot_scuff(self):
+        gait = self.cfg.gait
+        motion = (self.gait_horizontal_speed / gait.horizontal_speed_scale_m_s).clamp(0, 1)
+        low = torch.exp(-self.gait_clearance.clamp_min(0) / gait.scuff_height_m)
+        return (self.gait_swing * motion * low).mean(-1) * self._gait_moving()
+
+    def _reward_gait_air_time(self):
+        gait = self.cfg.gait
+        score = ((self.gait_preceding_air_time - gait.air_time_min_s)
+                 / gait.air_time_range_s).clamp(0, 1)
+        return (score * self.gait_touchdown).sum(-1).clamp_max(1) * self._gait_moving()
 
     def _reward_student_lin_vel_z(self):
         return quat_rotate_inverse(

@@ -1,5 +1,8 @@
 """Focused CPU contracts for the independent single-frame Pose AMP task."""
 from pathlib import Path
+import copy
+import importlib.util
+import math
 import sys
 import tempfile
 from types import ModuleType
@@ -24,8 +27,11 @@ from rsl_rl.modules.masked_pose_amp import (
     project_pose_amp,
 )
 from rsl_rl.runners.vel_track_pose_amp_on_policy_runner import (
+    GAIT_CONFIG_UPGRADE,
+    GAIT_REWARD_UPGRADE,
     TRAINING_CONTRACT,
     VelTrackPoseAMPOnPolicyRunner,
+    resume_environment_section_matches,
 )
 from rsl_rl.storage.mixed_handoff_rollout_storage import MixedHandoffRolloutStorage
 from rsl_rl.storage.vel_track_pose_amp_rollout_storage import VelTrackPoseAMPRolloutStorage
@@ -177,6 +183,10 @@ class PoseAMPTests(unittest.TestCase):
         self.assertIn('run_name = "pose_amp_v1"', config)
         self.assertIn('pose_style_weight = 2.0', config)
         self.assertIn('pose_gate_floor = 0.5', config)
+        self.assertIn('gait_foot_slip = -0.05', config)
+        self.assertIn('gait_swing_clearance = 0.08', config)
+        self.assertIn('gait_foot_scuff = -0.05', config)
+        self.assertIn('gait_air_time = 0.0', config)
         self.assertIn('"carrybox_vel_track_pose_amp"', registry)
         self.assertIn('make_env("carrybox_vel_track_pose_amp"', train)
         self.assertIn('make_env("carrybox_vel_track_pose_amp"', play)
@@ -189,6 +199,116 @@ class PoseAMPTests(unittest.TestCase):
                     "Train/mean_reward", "Train/pose_amp_bonus_to_task_reward",
                     "Train/pose_amp_nonzero_fraction"):
             self.assertIn(tag, source)
+
+    def test_tensorboard_gait_diagnostics_are_concise_and_explicit(self):
+        source = (ROOT / "rsl_rl/rsl_rl/runners/vel_track_pose_amp_on_policy_runner.py").read_text()
+        for tag in ("student/gait_foot_slip", "student/gait_swing_clearance",
+                    "student/gait_foot_scuff", "student/stance_slip_m_s",
+                    "student/swing_clearance_m", "student/low_clearance_swing_fraction"):
+            self.assertIn('"' + tag + '"', source)
+        self.assertNotIn('"student/gait_air_time"', source)
+
+    def test_tensorboard_gait_diagnostics_emit_finite_student_samples(self):
+        class GaitDiagnosticEnvironment(TensorEnvironment):
+            def step(self, actions):
+                result = list(super().step(actions))
+                result[4]["handoff"].update({
+                    "student/gait_foot_slip": torch.full((2,), .25),
+                    "student/gait_swing_clearance": torch.full((2,), .5),
+                    "student/gait_foot_scuff": torch.full((2,), .125),
+                    "student/stance_slip_m_s": torch.tensor([[.1, float("nan")], [.2, .3]]),
+                    "student/swing_clearance_m": torch.tensor([[float("nan"), .04], [.03, .05]]),
+                    "student/low_clearance_swing_fraction": torch.tensor([[float("nan"), 0.], [1., 0.]]),
+                })
+                return tuple(result)
+
+        with patch("torch.utils.tensorboard.SummaryWriter"):
+            runner = VelTrackPoseAMPOnPolicyRunner(
+                GaitDiagnosticEnvironment(), pose_configuration(False, 4), self.teacher,
+                log_dir=Path(self.temp.name) / "gait_logs")
+        runner.learn(1, optimize=False)
+        scalars = {call.args[0]: call.args[1] for call in runner.writer.add_scalar.call_args_list}
+        self.assertAlmostEqual(scalars["student/gait_foot_slip"], .25)
+        self.assertAlmostEqual(scalars["student/gait_swing_clearance"], .5)
+        self.assertAlmostEqual(scalars["student/gait_foot_scuff"], .125)
+        for tag in ("student/stance_slip_m_s", "student/swing_clearance_m",
+                    "student/low_clearance_swing_fraction"):
+            self.assertTrue(math.isfinite(scalars[tag]))
+
+    def test_current_urdf_builds_validated_roll_link_sole_geometry(self):
+        path = ROOT / "legged_gym/legged_gym/utils/gait_geometry.py"
+        spec = importlib.util.spec_from_file_location("pose_gait_geometry", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        geometry = module.build_gait_geometry(
+            ROOT / "legged_gym/resources/robots/g1/urdf/g1_29dof.urdf",
+            ("left_ankle_roll_link", "right_ankle_roll_link"),
+        )
+        self.assertEqual(geometry["urdf_sha256"],
+                         "427c3b69c2f3f3bfb16e1bfdecd564326a505642efba33198c8d33db44ac974e")
+        expected_meshes = {
+            "left_ankle_roll_link": "c4092af943141d4d9f74232f3cfa345afc6565f46a077793b8ae0e68b39dc33f",
+            "right_ankle_roll_link": "4b66222ea56653e627711b56d0a8949b4920da5df091da0ceb343f54e884e3a5",
+        }
+        for name, sha256 in expected_meshes.items():
+            body = geometry["bodies"][name]
+            self.assertEqual(body["mesh_sha256"], [sha256])
+            self.assertLessEqual(body["error"]["max_m"], .001)
+            self.assertLess(min(point[2] for point in body["points"]), -.035)
+
+    def test_legacy_reward_config_is_the_only_allowed_resume_upgrade(self):
+        old_rewards = dict(scales=dict(carry_lin_vel_tracking=3.),
+                           carry_lin_vel_sigma=.25, carry_yaw_vel_sigma=.25)
+        new_rewards = copy.deepcopy(old_rewards)
+        new_rewards["scales"].update(GAIT_REWARD_UPGRADE)
+        self.assertTrue(resume_environment_section_matches(
+            "student_rewards", old_rewards, new_rewards))
+        self.assertTrue(resume_environment_section_matches("gait", None, GAIT_CONFIG_UPGRADE))
+        changed = copy.deepcopy(new_rewards)
+        changed["scales"]["carry_lin_vel_tracking"] = 4.
+        self.assertFalse(resume_environment_section_matches(
+            "student_rewards", old_rewards, changed))
+        changed = copy.deepcopy(new_rewards)
+        changed["scales"]["gait_foot_slip"] = -.2
+        self.assertFalse(resume_environment_section_matches(
+            "student_rewards", old_rewards, changed))
+
+    def test_true_legacy_resume_restores_student_amp_and_optimizer_state(self):
+        old_cfg = pose_configuration(True, 4)
+        old_cfg["environment"] = {
+            "student_rewards": {
+                "scales": {"carry_lin_vel_tracking": 3.},
+                "carry_lin_vel_sigma": .25,
+                "carry_yaw_vel_sigma": .25,
+            }
+        }
+        trained = VelTrackPoseAMPOnPolicyRunner(
+            TensorEnvironment(), old_cfg, self.teacher, expert=PoseExpert())
+        trained.learn(1)
+        checkpoint = Path(self.temp.name) / "pre_gait_pose_amp.pt"
+        trained.save(checkpoint)
+        payload = torch.load(checkpoint, weights_only=False)
+
+        new_cfg = copy.deepcopy(old_cfg)
+        new_cfg["environment"]["student_rewards"]["scales"].update(GAIT_REWARD_UPGRADE)
+        new_cfg["environment"]["gait"] = copy.deepcopy(GAIT_CONFIG_UPGRADE)
+        resumed = VelTrackPoseAMPOnPolicyRunner(
+            TensorEnvironment(), new_cfg, self.teacher, expert=PoseExpert(), initialize=False)
+        resumed.load(checkpoint)
+        for name, expected in payload["model_state_dict"].items():
+            torch.testing.assert_close(resumed.alg.actor_critic.state_dict()[name], expected,
+                                       atol=0, rtol=0)
+        for name, expected in payload["amp_state_dict"].items():
+            torch.testing.assert_close(resumed.alg.amp.state_dict()[name], expected, atol=0, rtol=0)
+        actual_optimizer = resumed.alg.optimizer.state_dict()
+        self.assertEqual(actual_optimizer["param_groups"], payload["optimizer_state_dict"]["param_groups"])
+        for key, state in payload["optimizer_state_dict"]["state"].items():
+            for field, expected in state.items():
+                actual = actual_optimizer["state"][key][field]
+                if torch.is_tensor(expected):
+                    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+                else:
+                    self.assertEqual(actual, expected)
 
 
 class PoseExpertSamplingTests(unittest.TestCase):

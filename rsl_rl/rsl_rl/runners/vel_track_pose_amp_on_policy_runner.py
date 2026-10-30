@@ -21,6 +21,41 @@ TRAINING_CONTRACT = dict(actor_obs=738, critic_obs=126, actions=29, history_fram
                          amp_frame_features=54, amp_history=1,
                          expert_source="Pose-HOLD+CarryWith-mode-conditioned", version=1)
 
+GAIT_REWARD_UPGRADE = dict(gait_foot_slip=-0.05, gait_swing_clearance=0.08,
+                           gait_foot_scuff=-0.05, gait_air_time=0.0)
+GAIT_CONFIG_UPGRADE = dict(contact_threshold_N=1.0, moving_threshold=0.1,
+                           slip_tolerance_m_s=0.05, horizontal_speed_scale_m_s=0.30,
+                           target_height_m=0.04, scuff_height_m=0.02,
+                           air_time_min_s=0.06, air_time_range_s=0.20,
+                           geometry_max_points=128, geometry_fit_tolerance_m=0.0005,
+                           geometry_validation_tolerance_m=0.001)
+GAIT_PHYSICAL_DIAGNOSTICS = (
+    "student/stance_slip_m_s",
+    "student/swing_clearance_m",
+    "student/low_clearance_swing_fraction",
+)
+
+
+def resume_environment_section_matches(name, saved, current):
+    """Allow only the one-time addition of this task's audited gait objective."""
+    if saved == current:
+        return True
+    if name == "gait":
+        return saved is None and current == GAIT_CONFIG_UPGRADE
+    if name != "student_rewards" or not isinstance(saved, dict) or not isinstance(current, dict):
+        return False
+    saved_scales = saved.get("scales", {})
+    current_scales = current.get("scales", {})
+    if any(key in saved_scales for key in GAIT_REWARD_UPGRADE):
+        return False
+    saved_base = {key: value for key, value in saved_scales.items() if key not in GAIT_REWARD_UPGRADE}
+    current_base = {key: value for key, value in current_scales.items() if key not in GAIT_REWARD_UPGRADE}
+    saved_other = {key: value for key, value in saved.items() if key != "scales"}
+    current_other = {key: value for key, value in current.items() if key != "scales"}
+    current_gait = {key: current_scales.get(key) for key in GAIT_REWARD_UPGRADE}
+    return (saved_base == current_base and saved_other == current_other
+            and current_gait == GAIT_REWARD_UPGRADE)
+
 
 def read_checkpoint(path):
     try:
@@ -277,7 +312,10 @@ class VelTrackPoseAMPOnPolicyRunner:
                         stream.write(json.dumps(event) + "\n")
         for k, v in diag.items():
             if k.startswith(("student/", "student_reward_raw/", "student_reward_weighted/")):
-                samples[k] = v.to(self.device)[student].float().flatten()
+                values = v.to(self.device)[student].float().flatten()
+                if k in GAIT_PHYSICAL_DIAGNOSTICS:
+                    values = values[torch.isfinite(values)]
+                samples[k] = values
         for key, value in infos.get("episode", {}).items():
             if key.startswith("student/"):
                 samples["episode/" + key] = torch.as_tensor(value, device=self.device).detach().reshape(-1)
@@ -472,6 +510,13 @@ class VelTrackPoseAMPOnPolicyRunner:
                         "Train/pose_amp_nonzero_fraction": metrics.get("performance/pose_raw_nonzero"),
                         "Train/mean_pose_amp_raw_stand": metrics.get("performance/pose_stand_raw"),
                         "Train/mean_pose_amp_raw_moving": metrics.get("performance/pose_moving_raw"),
+                        "student/gait_foot_slip": metrics.get("performance/student/gait_foot_slip"),
+                        "student/gait_swing_clearance": metrics.get("performance/student/gait_swing_clearance"),
+                        "student/gait_foot_scuff": metrics.get("performance/student/gait_foot_scuff"),
+                        "student/stance_slip_m_s": metrics.get("performance/student/stance_slip_m_s"),
+                        "student/swing_clearance_m": metrics.get("performance/student/swing_clearance_m"),
+                        "student/low_clearance_swing_fraction": metrics.get(
+                            "performance/student/low_clearance_swing_fraction"),
                     }
                     if "amp_gradient_penalty" in metrics:
                         scalars["Loss/amp_loss"] = (metrics["amp_expert_loss"] +
@@ -569,8 +614,11 @@ class VelTrackPoseAMPOnPolicyRunner:
                 current_cfg = {k: v for k, v in current_cfg.items() if k != "expert_config"}
             if saved_cfg != current_cfg:
                 raise ValueError("Student resume configuration differs: " + key)
-        for key in ("control", "sim", "init_state", "handoff", "student_rewards", "student_termination", "domain_rand", "asset", "commands", "normalization", "dataset"):
-            if checkpoint["train_cfg"].get("environment", {}).get(key) != self.train_cfg.get("environment", {}).get(key):
+        for key in ("control", "sim", "init_state", "handoff", "student_rewards", "gait",
+                    "student_termination", "domain_rand", "asset", "commands", "normalization", "dataset"):
+            saved = checkpoint["train_cfg"].get("environment", {}).get(key)
+            current = self.train_cfg.get("environment", {}).get(key)
+            if not resume_environment_section_matches(key, saved, current):
                 raise ValueError("Student resume environment configuration differs: " + key)
         # Reset-window semantics belong to the environment contract; printing
         # reset diagnostics does not. Older exports have no training RSI field.
