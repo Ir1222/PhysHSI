@@ -49,8 +49,8 @@ class VelTrackPoseAMPCfg(G1Cfg):
 
     class student_rewards:
         class scales:
-            carry_lin_vel_tracking = 2.5 #3.0
-            carry_yaw_vel_tracking = 3.0
+            carry_lin_vel_tracking = 3.0
+            carry_yaw_vel_tracking = 2.5 #3.0
             carry_bilateral_contact = 0.5
             gait_foot_slip = -0.05
             gait_swing_clearance = 0.08
