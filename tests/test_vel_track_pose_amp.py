@@ -257,12 +257,19 @@ class PoseAMPTests(unittest.TestCase):
             self.assertLess(min(point[2] for point in body["points"]), -.035)
 
     def test_legacy_reward_config_is_the_only_allowed_resume_upgrade(self):
-        old_rewards = dict(scales=dict(carry_lin_vel_tracking=3.),
+        old_rewards = dict(scales=dict(carry_lin_vel_tracking=3.,
+                                       carry_yaw_vel_tracking=2.5),
                            carry_lin_vel_sigma=.25, carry_yaw_vel_sigma=.25)
         new_rewards = copy.deepcopy(old_rewards)
         new_rewards["scales"].update(GAIT_REWARD_UPGRADE)
+        new_rewards["scales"].update(carry_lin_vel_tracking=2.5,
+                                      carry_yaw_vel_tracking=3.0)
         self.assertTrue(resume_environment_section_matches(
             "student_rewards", old_rewards, new_rewards))
+        gait_checkpoint = copy.deepcopy(old_rewards)
+        gait_checkpoint["scales"].update(GAIT_REWARD_UPGRADE)
+        self.assertTrue(resume_environment_section_matches(
+            "student_rewards", gait_checkpoint, new_rewards))
         self.assertTrue(resume_environment_section_matches("gait", None, GAIT_CONFIG_UPGRADE))
         changed = copy.deepcopy(new_rewards)
         changed["scales"]["carry_lin_vel_tracking"] = 4.
@@ -272,12 +279,17 @@ class PoseAMPTests(unittest.TestCase):
         changed["scales"]["gait_foot_slip"] = -.2
         self.assertFalse(resume_environment_section_matches(
             "student_rewards", old_rewards, changed))
+        changed_saved = copy.deepcopy(gait_checkpoint)
+        changed_saved["scales"]["gait_swing_clearance"] = .2
+        self.assertFalse(resume_environment_section_matches(
+            "student_rewards", changed_saved, new_rewards))
 
     def test_true_legacy_resume_restores_student_amp_and_optimizer_state(self):
         old_cfg = pose_configuration(True, 4)
         old_cfg["environment"] = {
             "student_rewards": {
-                "scales": {"carry_lin_vel_tracking": 3.},
+                "scales": {"carry_lin_vel_tracking": 3.,
+                           "carry_yaw_vel_tracking": 2.5},
                 "carry_lin_vel_sigma": .25,
                 "carry_yaw_vel_sigma": .25,
             }
@@ -291,6 +303,8 @@ class PoseAMPTests(unittest.TestCase):
 
         new_cfg = copy.deepcopy(old_cfg)
         new_cfg["environment"]["student_rewards"]["scales"].update(GAIT_REWARD_UPGRADE)
+        new_cfg["environment"]["student_rewards"]["scales"].update(
+            carry_lin_vel_tracking=2.5, carry_yaw_vel_tracking=3.0)
         new_cfg["environment"]["gait"] = copy.deepcopy(GAIT_CONFIG_UPGRADE)
         resumed = VelTrackPoseAMPOnPolicyRunner(
             TensorEnvironment(), new_cfg, self.teacher, expert=PoseExpert(), initialize=False)

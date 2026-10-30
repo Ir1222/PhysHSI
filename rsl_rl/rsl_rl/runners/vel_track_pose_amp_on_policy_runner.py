@@ -23,6 +23,8 @@ TRAINING_CONTRACT = dict(actor_obs=738, critic_obs=126, actions=29, history_fram
 
 GAIT_REWARD_UPGRADE = dict(gait_foot_slip=-0.05, gait_swing_clearance=0.08,
                            gait_foot_scuff=-0.05, gait_air_time=0.0)
+STUDENT_REWARD_RETUNE = dict(carry_lin_vel_tracking=(3.0, 2.5),
+                             carry_yaw_vel_tracking=(2.5, 3.0))
 GAIT_CONFIG_UPGRADE = dict(contact_threshold_N=1.0, moving_threshold=0.1,
                            slip_tolerance_m_s=0.05, horizontal_speed_scale_m_s=0.30,
                            target_height_m=0.04, scuff_height_m=0.02,
@@ -37,7 +39,7 @@ GAIT_PHYSICAL_DIAGNOSTICS = (
 
 
 def resume_environment_section_matches(name, saved, current):
-    """Allow only the one-time addition of this task's audited gait objective."""
+    """Allow only the audited gait addition and velocity-weight retune."""
     if saved == current:
         return True
     if name == "gait":
@@ -46,15 +48,20 @@ def resume_environment_section_matches(name, saved, current):
         return False
     saved_scales = saved.get("scales", {})
     current_scales = current.get("scales", {})
-    if any(key in saved_scales for key in GAIT_REWARD_UPGRADE):
+    saved_gait = {key: saved_scales[key] for key in GAIT_REWARD_UPGRADE
+                  if key in saved_scales}
+    current_gait = {key: current_scales.get(key) for key in GAIT_REWARD_UPGRADE}
+    if ((saved_gait and saved_gait != GAIT_REWARD_UPGRADE)
+            or current_gait != GAIT_REWARD_UPGRADE):
         return False
     saved_base = {key: value for key, value in saved_scales.items() if key not in GAIT_REWARD_UPGRADE}
     current_base = {key: value for key, value in current_scales.items() if key not in GAIT_REWARD_UPGRADE}
+    for key, (old, new) in STUDENT_REWARD_RETUNE.items():
+        if saved_base.get(key) == old and current_base.get(key) == new:
+            saved_base[key] = new
     saved_other = {key: value for key, value in saved.items() if key != "scales"}
     current_other = {key: value for key, value in current.items() if key != "scales"}
-    current_gait = {key: current_scales.get(key) for key in GAIT_REWARD_UPGRADE}
-    return (saved_base == current_base and saved_other == current_other
-            and current_gait == GAIT_REWARD_UPGRADE)
+    return saved_base == current_base and saved_other == current_other
 
 
 def read_checkpoint(path):
